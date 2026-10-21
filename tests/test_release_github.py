@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 import copy
 from http.client import IncompleteRead
+import io
 import json
 from pathlib import Path
 import sys
@@ -390,7 +391,7 @@ class GitHubProviderTests(unittest.TestCase):
 
     def test_network_uses_auth_timeout_no_redirect_and_safe_http_errors(self):
         client = github.GitHubClient('test-secret', timeout=9)
-        error = HTTPError('https://api.github.com/repos/example/approved', 403, 'secret', {}, None)
+        error = HTTPError('https://api.github.com/repos/example/approved', 403, 'secret', {}, io.BytesIO(b'private error body'))
         with mock.patch.object(client._opener, 'open', side_effect=error) as opened:
             with self.assertRaises(execution.ProviderRejected) as caught:
                 client.request('POST', '/repos/example/approved/releases', {})
