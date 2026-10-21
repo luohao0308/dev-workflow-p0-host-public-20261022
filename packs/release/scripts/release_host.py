@@ -219,17 +219,20 @@ class GitHubActionsApproval:
         expected = {'iss': ISSUER, 'aud': AUDIENCE, 'repository': policy.host_repository,
                     'repository_id': str(policy.host_repository_id), 'workflow_ref': policy.workflow_ref,
                     'workflow_sha': policy.workflow_sha, 'run_id': str(policy.run_id), 'run_attempt': '1',
-                    'environment': policy.environment,
-                    'sub': 'repo:' + policy.host_repository + ':environment:' + policy.environment}
+                    'environment': policy.environment}
         mismatches = tuple(key for key, value in expected.items() if claims.get(key) != value)
         if mismatches:
             _deny('OIDC workflow identity does not match trusted policy', mismatch_fields=mismatches)
+        host_repository = None
         for slug, identity in ((policy.host_repository, policy.host_repository_id),
                                (policy.target_repository, policy.target_repository_id),
                                (policy.ledger_repository, policy.ledger_repository_id)):
             repo = self._get('/repos/' + slug)
             if repo.get('id') != identity or repo.get('full_name') != slug:
                 _deny('GitHub repository identity changed')
+            if slug == policy.host_repository:
+                host_repository = repo
+        self._verify_subject(claims, host_repository)
         run_path = '/repos/' + policy.host_repository + '/actions/runs/' + str(policy.run_id)
         run = self._get(run_path)
         if (run.get('id') != policy.run_id or run.get('run_attempt') != 1 or run.get('head_sha') != policy.workflow_sha
@@ -265,6 +268,30 @@ class GitHubActionsApproval:
         self._expires = min(claims['exp'], bundle_expiry)
         if time.time() >= self._expires:
             _deny('Authorization expired during authority verification')
+
+    def _verify_subject(self, claims, repository):
+        # Repository API settings select the exact format. Neither a token's
+        # appearance nor project-controlled data may choose a weaker subject.
+        policy = self.policy
+        settings = self._get('/repos/' + policy.host_repository + '/actions/oidc/customization/sub')
+        if (not isinstance(settings, dict) or settings.get('use_default') is not True
+                or ('include_claim_keys' in settings and settings['include_claim_keys'] != [])):
+            _deny('Custom OIDC subject templates are unsupported')
+        immutable = settings.get('use_immutable_subject', False)
+        if type(immutable) is not bool:
+            _deny('Invalid OIDC immutable subject configuration')
+        owner_name, repository_name = policy.host_repository.split('/')
+        if immutable:
+            owner = repository.get('owner')
+            if not isinstance(owner, dict) or type(owner.get('id')) is not int or owner['id'] <= 0:
+                _deny('Immutable OIDC subject requires authenticated owner identity')
+            prefix = 'repo:' + owner_name + '@' + str(owner['id']) + '/' + repository_name + '@' + str(policy.host_repository_id)
+        else:
+            prefix = 'repo:' + policy.host_repository
+        if 'sub_claim_prefix' in settings and settings['sub_claim_prefix'] != prefix:
+            _deny('OIDC subject prefix disagrees with authenticated repository identity')
+        if claims.get('sub') != prefix + ':environment:' + policy.environment:
+            _deny('OIDC workflow identity does not match trusted policy', mismatch_fields=('sub',))
 
     def _match(self, request):
         if not isinstance(request, Request) or self._requests.get(request.digest()) != request:

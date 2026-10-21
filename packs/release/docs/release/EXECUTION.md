@@ -68,7 +68,7 @@ python3 scripts/release_execute.py plan --repo . --preparation .dev-workflow/rel
 - 目标 `target_repository` / `target_repository_id`，以及项目之外的 `ledger_repository` / `ledger_repository_id` / `ledger_sha`。账本与目标必须是不同仓库；账本 SHA 必须是账本已有的固定对象。
 - 允许的个人 reviewer ID、`prevent_self_review` 和准确操作集合的 `expires_at`。bundle 最长一小时，实际授权还受短期 OIDC 到期限制。
 
-凭据由可信宿主的受保护环境提供，不写入候选 checkout、计划、日志或审计文件。需要分别具备：目标仓库的 Contents 读写（创建 refs / Release，并完整观察草稿）；宿主仓库的 Actions、环境与审批记录读取权限；独立账本仓库的 Contents 读写。具体 token 类型及权限由所选宿主配置，但读取不到完整身份、权限或审批数据时须拒绝；公共只读 token 不足以证明没有同名草稿。工作流只授予请求 GitHub OIDC 所需的 `id-token: write`，不因安装 release 包自动创建凭据或修改仓库设置。
+凭据由可信宿主的受保护环境提供，不写入候选 checkout、计划、日志或审计文件。需要分别具备：目标仓库的 Contents 读写（创建 refs / Release，并完整观察草稿）；宿主仓库的 Actions、环境、审批记录与 OIDC subject 设置读取权限；独立账本仓库的 Contents 读写。具体 token 类型及权限由所选宿主配置，但读取不到完整身份、权限或审批数据时须拒绝；公共只读 token 不足以证明没有同名草稿。工作流只授予请求 GitHub OIDC 所需的 `id-token: write`，不因安装 release 包自动创建凭据或修改仓库设置。
 
 ### 最小宿主配置与 runner
 
@@ -106,14 +106,15 @@ python3 -I trusted/scripts/release_host_runner.py prepare --policy trusted/host-
 python3 -I trusted/scripts/release_host_runner.py execute --policy trusted/host-policy.json --repo /tmp/dev-workflow-target --record preview.json --output results.json
 ```
 
-示例中 preview 的 `TARGET_READ_TOKEN` 仅用于克隆私有目标项目，公开仓库可按实际权限配置。protected execute 的 `RELEASE_TOKEN` 来自受保护环境，当前 runner 使用同一凭据读取宿主运行、环境和审批，并写宿主账本及目标 tag / Release；须将权限限制到这两个已核实仓库及上述必要 API。`ACTIONS_ID_TOKEN_REQUEST_*` 只由 GitHub 运行时提供，用于取短期签名身份，不能在本机填造替代。执行输出保存逐操作结果；成功后额外只读重验已存在对象，核对没有再次消耗授权。任何步骤失败都不会自动重试变更。
+示例中 preview 的 `TARGET_READ_TOKEN` 仅用于克隆私有目标项目，公开仓库可按实际权限配置。protected execute 的 `RELEASE_TOKEN` 来自受保护环境，当前 runner 使用同一凭据读取宿主运行、环境、审批和 OIDC subject 设置，并写宿主账本及目标 tag / Release；须将权限限制到这两个已核实仓库及上述必要 API。`ACTIONS_ID_TOKEN_REQUEST_*` 只由 GitHub 运行时提供，用于取短期签名身份，不能在本机填造替代。执行输出保存逐操作结果；成功后额外只读重验已存在对象，核对没有再次消耗授权。任何步骤失败都不会自动重试变更。
 
 ### 审核与执行顺序
 
 1. 在不执行候选代码的条件下生成准备和执行计划；固定操作集合、仓库 / remote / HEAD / 目标 SHA / raw tag 身份及 Release 全部内容，并计算 `bundle_digest(requests, expires_at, policy.bundle_context())`。审核材料须展示这些准确值及 expiry，不能只展示版本号或摘要。
-2. 进入受保护环境前将审核材料和 bundle hash 展示给用户。环境必须要求策略中的个人 reviewer，`can_admins_bypass=false`，不得用管理员绕过。默认 `prevent_self_review=true`；单用户宿主可在可信策略中显式设为 `false`，环境设置须准确一致，仍须本人真实执行 GitHub 环境审批。
-3. reviewer 在环境审批中输入准确评论 `dev-workflow approve <bundle hash>`。聊天中的任务指令、项目 approval JSON、普通工作流 dispatch 或 agent 代发的审批均不能替代这条真实审批记录。
+2. 进入受保护环境前将审核材料和 bundle hash 展示给用户。环境必须要求策略中的个人 reviewer，`can_admins_bypass=false`，不得用管理员绕过。默认 `prevent_self_review=true`；单用户宿主可在可信策略中显式设为 `false`，环境设置须准确一致，仍须取得该 reviewer 账户下的真实 GitHub 环境审批记录。
+3. reviewer 的真实 GitHub 环境审批记录必须包含准确评论 `dev-workflow approve <bundle hash>`。聊天中的一般任务指令、项目 approval JSON 或普通工作流 dispatch 不等于已经存在审批记录。用户也可在看过准确 run、bundle hash、仓库、版本和操作集合后，明确授权代理通过已验证的 GitHub 账户登记该次审批；代理只可登记该准确范围，并保留直接用户授权证据，将审批方法记为 delegated，不能声称用户亲自在 GitHub 页面点击或经过独立人工复核。仅持有环境 token、执行权限或此前的泛化授权不能自行代批。
 4. 宿主验证 GitHub OIDC 的 RS256 签名和固定 issuer / audience，再匹配仓库 ID、workflow SHA / ref、run ID、attempt、actor、环境及时间；通过 GitHub API 重读工作流、环境保护和准确审批。首个宿主限 GitHub-hosted Linux，使用固定 `/usr/bin/openssl` 验签；这不宣称 Windows 上的 Actions 宿主已经验收。
+   Subject 还须通过认证后的宿主仓库设置核验：读取 `/repos/{owner}/{repo}/actions/oidc/customization/sub`，仅接受实际使用默认 subject 的配置，自定义模板拒绝。immutable 默认模式的前缀由已核实的仓库名称、API 返回的 owner ID 和策略仓库 ID 构造为 `repo:OWNER@OWNER-ID/REPO@REPO-ID`，再准确匹配 `:environment:ENVIRONMENT`；不能从 JWT 自报的前缀放宽比较。legacy 名称格式只在 API 确认实际 legacy 默认配置时接受。GitHub 对 2026-07-15 后新建的仓库启用 immutable 默认 subject，旧仓库及迁移情形以实时配置为准，见 [GitHub OIDC reference](https://docs.github.com/en/actions/reference/security/oidc#immutable-subject-claims)。读取配置失败、ID 不同、未知模式或 subject 不一致均拒绝，不尝试降级。
 5. 每个操作先在独立账本创建 `refs/tags/workflow-grants/<run ID>/<bundle hash>/<operation>`，只创建不存在的 ref，再分发变更。每个操作 `max_uses=1`；已有标记、丢失响应或无法确认登记均拒绝继续，失败或未知结果不退还次数。provider 在实际变更前再次核验授权和账本。
 6. 逐操作读取真实远端对象、记录结果。需要再次尝试时先只读查清结果，再取得新运行、新审核与有效授权；不能通过 workflow rerun、删除账本标记或修改候选文件恢复使用次数。
 

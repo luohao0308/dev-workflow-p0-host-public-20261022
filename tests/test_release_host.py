@@ -50,7 +50,8 @@ class Client:
     def __init__(self, p, requests):
         self.policy, self.markers, self.lock = p, {}, threading.Lock()
         self.data = {
-            '/repos/sample/host': {'id': 1, 'full_name': 'sample/host'},
+            '/repos/sample/host': {'id': 1, 'full_name': 'sample/host', 'owner': {'id': 10}},
+            '/repos/sample/host/actions/oidc/customization/sub': {'use_default': True},
             '/repos/sample/target': {'id': 2, 'full_name': 'sample/target'},
             '/repos/sample/ledger': {'id': 3, 'full_name': 'sample/ledger'},
             '/repos/sample/host/actions/runs/123': dict(id=123, run_attempt=1, head_sha=SHA,
@@ -257,6 +258,67 @@ class ReleaseHostTests(unittest.TestCase):
             return now if len(calls) == 1 else now + 600
         with mock.patch.object(host.time, 'time', side_effect=advancing_time):
             with self.assertRaises(AuthorizationUnavailable):
+                self.make_host()
+
+    def test_immutable_subject_uses_authenticated_owner_and_repository_ids(self):
+        path = '/repos/sample/host/actions/oidc/customization/sub'
+        prefix = 'repo:sample@10/host@1'
+        self.client.data[path] = dict(use_default=True, use_immutable_subject=True, sub_claim_prefix=prefix)
+        self.claims['sub'] = prefix + ':environment:release'
+        self.make_host()
+        self.client.data[path].pop('sub_claim_prefix')
+        self.make_host()
+
+    def test_legacy_subject_explicit_and_omitted_mode(self):
+        path = '/repos/sample/host/actions/oidc/customization/sub'
+        self.make_host()
+        self.client.data[path] = dict(use_default=True, use_immutable_subject=False, sub_claim_prefix='repo:sample/host')
+        self.make_host()
+
+    def test_immutable_subject_wrong_ids_and_legacy_downgrade_rejected(self):
+        path = '/repos/sample/host/actions/oidc/customization/sub'
+        self.client.data[path] = dict(use_default=True, use_immutable_subject=True)
+        for subject in ('repo:sample@999/host@1:environment:release',
+                        'repo:sample@10/host@999:environment:release',
+                        'repo:other@10/host@1:environment:release',
+                        'repo:sample/host:environment:release',
+                        'repo:sample@10/host@1:environment:other'):
+            with self.subTest(subject=subject):
+                self.claims['sub'] = subject
+                with self.assertRaises(AuthorizationUnavailable):
+                    self.make_host()
+
+    def test_immutable_owner_identity_required(self):
+        path = '/repos/sample/host/actions/oidc/customization/sub'
+        self.client.data[path] = dict(use_default=True, use_immutable_subject=True)
+        self.claims['sub'] = 'repo:sample@10/host@1:environment:release'
+        for owner in (None, {}, {'id': 0}, {'id': '10'}, {'id': True}):
+            with self.subTest(owner=owner):
+                self.client.data['/repos/sample/host']['owner'] = owner
+                with self.assertRaises(AuthorizationUnavailable):
+                    self.make_host()
+
+    def test_subject_settings_reject_custom_malformed_and_conflicting_prefix(self):
+        path = '/repos/sample/host/actions/oidc/customization/sub'
+        variants = [[], {}, dict(use_default=False), dict(use_default=1),
+                    dict(use_default=True, use_immutable_subject='true'),
+                    dict(use_default=True, use_immutable_subject=1),
+                    dict(use_default=True, use_immutable_subject=None),
+                    dict(use_default=True, include_claim_keys=['repo', 'job_workflow_ref']),
+                    dict(use_default=True, sub_claim_prefix='repo:other/host'),
+                    dict(use_default=True, sub_claim_prefix=None),
+                    dict(use_default=True, use_immutable_subject=True, sub_claim_prefix='repo:sample/host')]
+        for settings in variants:
+            with self.subTest(settings=settings):
+                self.client.data[path] = settings
+                with self.assertRaises(AuthorizationUnavailable):
+                    self.make_host()
+
+    def test_immutable_token_cannot_select_format_when_settings_are_legacy(self):
+        self.claims['sub'] = 'repo:sample@10/host@1:environment:release'
+        for mode in ({'use_default': True}, {'use_default': True, 'use_immutable_subject': False}):
+            self.client.data['/repos/sample/host/actions/oidc/customization/sub'] = mode
+            with self.subTest(mode=mode), self.assertRaises(AuthorizationUnavailable):
                 self.make_host()
 
     def test_default_verifier_does_not_accept_unsigned_claims(self):
