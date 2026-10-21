@@ -1,0 +1,24 @@
+{
+  "hostRepository": "luohao0308/dev-workflow-p0-host-public-20261022",
+  "hostRepositoryId": 1428943173,
+  "workflowRef": "luohao0308/dev-workflow-p0-host-public-20261022/.github/workflows/release-validation.yml@refs/heads/master",
+  "environment": "release-validation",
+  "reviewerIds": [
+    84822776
+  ],
+  "preventSelfReview": false,
+  "targetRepository": "luohao0308/dev-workflow-p0-target-20261022",
+  "targetRepositoryId": 1428943581,
+  "candidatePath": "/tmp/dev-workflow-target",
+  "operations": [
+    "local-tag-create",
+    "remote-tag-push",
+    "remote-release-create"
+  ],
+  "release": {
+    "name": "P0 isolated release validation",
+    "body": "Synthetic dev-workflow release validation. No application deployment or production changes.\n",
+    "draft": false,
+    "prerelease": true
+  }
+}
