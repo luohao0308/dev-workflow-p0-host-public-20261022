@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import sys
 from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, build_opener, ProxyHandler
@@ -104,6 +105,7 @@ def main(argv=None):
     parser.add_argument('--version')
     parser.add_argument('--output', type=Path)
     args = parser.parse_args(argv)
+    phase = 'load-policy'
     try:
         config = object_file(args.policy)
         root = args.repo.resolve()
@@ -113,6 +115,7 @@ def main(argv=None):
         operations = tuple(config['operations'])
         if not operations or len(set(operations)) != len(operations) or any(op not in execution.OPERATIONS for op in operations):
             raise execution.ExecutionError('Invalid host operation policy')
+        phase = 'adopt-candidate'
         bootstrap(root)
         if args.action == 'prepare':
             if not args.version:
@@ -123,9 +126,11 @@ def main(argv=None):
             plan = execution.build_plan(root, prepared, remote='origin', release=spec)
             record = dict(plan=plan, expiresAt=(execution.clock() + timedelta(minutes=55)).isoformat())
         else:
+            phase = 'recheck-plan'
             record = object_file(args.record)
             plan = record['plan']
             execution.recheck(root, plan)
+        phase = 'freeze-request'
         policy = policy_for(config, record)
         requests = tuple(execution.request_for(root, plan, operation) for operation in operations)
         digest = bundle_digest(requests, policy.expires_at, policy.bundle_context())
@@ -149,14 +154,20 @@ def main(argv=None):
                         + record['approvalComment'] + '`\n')
             print(json.dumps(record, ensure_ascii=True, indent=2))
             return 0
+        phase = 'verify-preview'
         if record.get('bundleHash') != digest or record.get('operations') != list(operations):
             raise execution.AuthorizationUnavailable('Preview differs from frozen host intent')
+        phase = 'create-client'
         client = GitHubClient(os.environ['RELEASE_TOKEN'])
-        approval = GitHubActionsApproval(client, oidc_token(), requests, policy)
+        phase = 'oidc-bootstrap'
+        identity = oidc_token()
+        phase = 'authority-verification'
+        approval = GitHubActionsApproval(client, identity, requests, policy)
         tags = GitHubTagProvider(client, policy.target_repository, policy.target_repository_id, before_mutation=approval.guard)
         releases = GitHubReleaseProvider(client, policy.target_repository, policy.target_repository_id, before_mutation=approval.guard)
         results = []
         for operation in operations:
+            phase = 'execute-' + operation
             result = execution.execute(root, plan, operation, approval=approval, tag_provider=tags, release_provider=releases)
             results.append(result)
             if result['status'] not in ('created_verified', 'already_present_verified'):
@@ -166,6 +177,7 @@ def main(argv=None):
         repeated = []
         if complete:
             for operation in operations:
+                phase = 'verify-existing-' + operation
                 repeated.append(execution.execute(root, plan, operation, approval=approval, tag_provider=tags, release_provider=releases))
             complete = all(item['status'] == 'already_present_verified' and not item['authorizationConsumed'] for item in repeated)
         output = dict(complete=complete, bundleHash=digest, results=results, repeated=repeated)
@@ -175,9 +187,21 @@ def main(argv=None):
                 stream.write('\n')
         print(json.dumps(output, ensure_ascii=True, indent=2))
         return 0 if complete else 1
-    except Exception:
+    except Exception as error:
         # Tokens, transport responses, paths with credentials and JWTs never enter logs.
-        print(json.dumps({'error': 'Trusted release host failed; no automatic mutation retry'}), file=sys.stderr)
+        failure = dict(complete=False, error='Trusted release host failed; no automatic mutation retry',
+                       phase=phase, errorType=type(error).__name__)
+        code = getattr(error, 'failure_code', None)
+        if isinstance(code, str) and re.fullmatch(r'authorization-[0-9a-f]{12}', code):
+            failure['failureCode'] = code
+        if args.output:
+            try:
+                with args.output.open('x', encoding='utf-8') as stream:
+                    json.dump(failure, stream, ensure_ascii=True, indent=2)
+                    stream.write('\n')
+            except OSError:
+                pass
+        print(json.dumps(failure), file=sys.stderr)
         return 1
 
 

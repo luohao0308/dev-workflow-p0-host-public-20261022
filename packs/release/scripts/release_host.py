@@ -30,7 +30,11 @@ def bundle_digest(requests, expires_at, context=None):
 
 
 def _deny(message):
-    raise AuthorizationUnavailable(message)
+    error = AuthorizationUnavailable(message)
+    # Messages here are fixed host diagnostics, never response bodies or tokens.
+    # Preserve a stable bounded identifier when the runner suppresses raw errors.
+    error.failure_code = 'authorization-' + hashlib.sha256(message.encode('utf-8')).hexdigest()[:12]
+    raise error
 
 
 def _decode(value):

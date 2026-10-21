@@ -77,9 +77,15 @@ class ReleaseHostRunnerTests(unittest.TestCase):
     def test_forged_identity_cannot_execute_preview(self):
         self.assertEqual(self.run_host('prepare', '--version', '1.2.3'), 0)
         self.fresh_checkout()
-        with mock.patch.object(runner, 'oidc_token', return_value='forged-identity'), \
+        output = self.base / 'failure.json'
+        with mock.patch.object(runner, 'oidc_token', return_value='forged-identity') as identity, \
                 mock.patch.object(runner.GitHubClient, 'request', side_effect=AssertionError('No API expected')):
-            self.assertEqual(self.run_host('execute'), 1)
+            self.assertEqual(self.run_host('execute', '--output', str(output)), 1)
+            identity.assert_called_once()
+        failure = json.loads(output.read_text(encoding='utf-8'))
+        self.assertEqual(failure['phase'], 'authority-verification')
+        self.assertEqual(failure['errorType'], 'AuthorizationUnavailable')
+        self.assertNotIn('forged-identity', output.read_text(encoding='utf-8'))
         self.assertEqual(self.git('tag'), '')
 
     def test_preview_preserves_noncanonical_configuration_bytes(self):
