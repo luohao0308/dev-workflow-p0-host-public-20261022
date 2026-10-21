@@ -194,6 +194,11 @@ def main(argv=None):
         code = getattr(error, 'failure_code', None)
         if isinstance(code, str) and re.fullmatch(r'authorization-[0-9a-f]{12}', code):
             failure['failureCode'] = code
+        fields = getattr(error, 'mismatch_fields', ())
+        identity_keys = {'iss', 'aud', 'repository', 'repository_id', 'workflow_ref', 'workflow_sha',
+                         'run_id', 'run_attempt', 'environment', 'sub'}
+        if isinstance(fields, tuple) and fields and all(field in identity_keys for field in fields):
+            failure['mismatchedClaims'] = list(fields)
         if args.output:
             try:
                 with args.output.open('x', encoding='utf-8') as stream:

@@ -29,11 +29,12 @@ def bundle_digest(requests, expires_at, context=None):
     return hashlib.sha256(canonical({'context': context, 'expiresAt': expires_at, 'requests': [request.digest() for request in requests]}).encode('ascii')).hexdigest()
 
 
-def _deny(message):
+def _deny(message, *, mismatch_fields=()):
     error = AuthorizationUnavailable(message)
     # Messages here are fixed host diagnostics, never response bodies or tokens.
     # Preserve a stable bounded identifier when the runner suppresses raw errors.
     error.failure_code = 'authorization-' + hashlib.sha256(message.encode('utf-8')).hexdigest()[:12]
+    error.mismatch_fields = tuple(mismatch_fields)
     raise error
 
 
@@ -220,8 +221,9 @@ class GitHubActionsApproval:
                     'workflow_sha': policy.workflow_sha, 'run_id': str(policy.run_id), 'run_attempt': '1',
                     'environment': policy.environment,
                     'sub': 'repo:' + policy.host_repository + ':environment:' + policy.environment}
-        if any(claims.get(key) != value for key, value in expected.items()):
-            _deny('OIDC workflow identity does not match trusted policy')
+        mismatches = tuple(key for key, value in expected.items() if claims.get(key) != value)
+        if mismatches:
+            _deny('OIDC workflow identity does not match trusted policy', mismatch_fields=mismatches)
         for slug, identity in ((policy.host_repository, policy.host_repository_id),
                                (policy.target_repository, policy.target_repository_id),
                                (policy.ledger_repository, policy.ledger_repository_id)):
