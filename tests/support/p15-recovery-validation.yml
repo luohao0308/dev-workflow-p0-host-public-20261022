@@ -15,7 +15,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: p15-recovery-validation-${{ inputs.real_authority }}
+  group: p15-recovery-validation-${{ inputs.real_authority }}-${{ inputs.full_matrix }}
   cancel-in-progress: false
 jobs:
   observer:
