@@ -5,6 +5,7 @@ from datetime import timedelta
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib.util
+from io import BytesIO
 import json
 import os
 from pathlib import Path
@@ -13,9 +14,11 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import tarfile
 import threading
 import unittest
 from unittest import mock
+from urllib.parse import urlencode
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
@@ -46,17 +49,34 @@ def policy(**changes):
     return runtime.RuntimePolicy(**values)
 
 
+def managed_archive(name, content=b'fixture', *, kind=tarfile.REGTYPE):
+    buffer = BytesIO()
+    with tarfile.open(fileobj=buffer, mode='w') as archive:
+        member = tarfile.TarInfo(name)
+        member.type = kind
+        member.size = len(content) if kind == tarfile.REGTYPE else 0
+        archive.addfile(member, BytesIO(content) if member.size else None)
+    return buffer.getvalue()
+
+
 class DockerFixture:
     def __init__(self):
         self.calls = []
         self.info = {'ID': 'fixture-daemon'}
-        self.container = {'Id': CID, 'Image': IMAGE, 'Path': '/web', 'Args': [],
+        self.files = {'hosts': b'127.0.0.1 localhost\n', 'hostname': b'fixture-web\n',
+                      'resolv.conf': b'nameserver 127.0.0.11\n'}
+        self.container = {'HostsPath': '/var/lib/docker/containers/' + CID + '/hosts',
+                          'HostnamePath': '/var/lib/docker/containers/' + CID + '/hostname',
+                          'ResolvConfPath': '/var/lib/docker/containers/' + CID + '/resolv.conf',
+                          'NetworkSettings': {'Networks': {'fixture_default': {'IPAddress': '172.18.0.2'}}}, 'Id': CID, 'Image': IMAGE, 'Path': '/web', 'Args': [],
                           'Config': {'Labels': {'com.docker.compose.project': 'fixture',
                                                 'com.docker.compose.service': 'web'},
                                      'Env': ['TOKEN=' + SECRET], 'Volumes': None,
                                      'Cmd': ['/web'], 'User': '1000'},
                           'HostConfig': {'ReadonlyRootfs': True, 'Binds': None,
-                                         'VolumesFrom': None, 'Tmpfs': None}, 'Mounts': [],
+                                         'VolumesFrom': None, 'Tmpfs': None, 'Privileged': False,
+                                         'Devices': [], 'DeviceRequests': None, 'CapAdd': None,
+                                         'PidMode': '', 'IpcMode': 'private', 'NetworkMode': 'fixture_default'}, 'Mounts': [],
                           'State': {'Running': True, 'Paused': False, 'Restarting': False,
                                     'Dead': False, 'Status': 'running', 'Pid': 123,
                                     'StartedAt': '2026-01-01T00:00:00.000000000Z'}}
@@ -76,6 +96,11 @@ class DockerFixture:
             return deepcopy(self.container)
         if path == '/v1.45/images/' + IMAGE + '/json':
             return deepcopy(self.image)
+        for name, content in self.files.items():
+            # A second fixture container uses the same fixed managed files.
+            if (runtime.re.fullmatch(r'/v1\.45/containers/[0-9a-f]{64}/archive', path.split('?')[0])
+                    and path.endswith('/archive?' + urlencode({'path': '/etc/' + name}))):
+                return managed_archive(name, content)
         raise AssertionError('Unexpected route')
 
 
@@ -102,9 +127,108 @@ class RuntimeTests(unittest.TestCase):
         for text in (SECRET, 'HostConfig', 'TOKEN=', 'Env', 'ReadonlyRootfs'):
             self.assertNotIn(text, observation.payload_json)
         self.assertEqual(fixture.calls.count('/v1.45/info'), 2)
-        self.assertEqual(len(fixture.calls), 8)
+        self.assertEqual(len(fixture.calls), 14)
         from tests.test_deployment_prepare import planner
         self.assertEqual(planner.manifest(snapshot, 'deployment-snapshot', 'staging', 'fixture', ['web']), snapshot)
+
+    def test_managed_file_contents_and_inspect_paths_are_bound_without_export(self):
+        for filename, field in runtime.MANAGED_FILES.items():
+            for change_path in (False, True):
+                c, fixture = collector()
+                previous = c.collect()
+                if change_path:
+                    fixture.container[field] += '-changed'
+                else:
+                    fixture.files[filename] = SECRET.encode()
+                with self.subTest(filename=filename, path=change_path):
+                    with self.assertRaisesRegex(runtime.RuntimeCollectionError, 'changed'):
+                        c.recheck(previous)
+                    self.assertNotIn(SECRET, c.collect().payload_json)
+        self.assertIn('/v1.45/containers/' + CID + '/archive?path=%2Fetc%2Fhosts', fixture.calls)
+
+    def test_unknown_managed_files_and_networks_are_incomplete(self):
+        for field in runtime.MANAGED_FILES:
+            for value in (None, '', 123, '/tmp/../hosts', '/tmp/hosts\x00'):
+                c, fixture = collector()
+                fixture.container[runtime.MANAGED_FILES[field]] = value
+                observation = c.collect()
+                self.assertFalse(observation.to_dict()['complete'])
+                with self.assertRaises(runtime.RuntimeCollectionError):
+                    c.validate(observation)
+        c, fixture = collector()
+        fixture.container.pop('NetworkSettings')
+        self.assertFalse(c.collect().to_dict()['complete'])
+
+    def test_unsafe_profiles_are_incomplete(self):
+        for changes in ({'Privileged': True}, {'Devices': [{'PathOnHost': SECRET}]},
+                        {'DeviceRequests': [{'Count': -1}]}, {'CapAdd': ['SYS_ADMIN']},
+                        {'CapAdd': ['CAP_SYS_ADMIN']}, {'CapAdd': ['ALL']},
+                        {'PidMode': 'host'}, {'IpcMode': 'host'}, {'NetworkMode': 'host'},
+                        {'NetworkMode': 'container:external'}, {'Privileged': None}):
+            c, fixture = collector()
+            fixture.container['HostConfig'].update(changes)
+            with self.subTest(changes=changes):
+                observation = c.collect()
+                self.assertFalse(observation.to_dict()['complete'])
+                self.assertNotIn(SECRET, observation.payload_json)
+
+    def test_live_network_connect_drift_rejects_recheck(self):
+        c, fixture = collector()
+        previous = c.collect()
+        fixture.container['NetworkSettings']['Networks']['external'] = {'IPAddress': SECRET}
+        with self.assertRaisesRegex(runtime.RuntimeCollectionError, 'changed'):
+            c.recheck(previous)
+        self.assertNotIn(SECRET, c.collect().payload_json)
+
+    def test_managed_archive_is_strict_bounded_and_fixed_route(self):
+        c, fixture = collector()
+        for name in ('/etc/hosts', '../hosts', 'passwd', '/etc/passwd', ''):
+            with self.assertRaises(runtime.RuntimeCollectionError):
+                c.client.managed_file(CID, name)
+        self.assertEqual(fixture.calls, [])
+        for identity in ('short', CID + '/..', None):
+            with self.assertRaises(runtime.RuntimeCollectionError):
+                c.client.managed_file(identity, 'hosts')
+        bad = [b'not tar', {}, b'x' * (runtime.MAX_RESPONSE + 1),
+               managed_archive('hosts', b'x' * (runtime.MAX_MANAGED_FILE + 1)),
+               managed_archive('../hosts'), managed_archive('/etc/hosts'), managed_archive('hostname')]
+        for kind in (tarfile.SYMTYPE, tarfile.LNKTYPE, tarfile.DIRTYPE, tarfile.CHRTYPE, tarfile.GNUTYPE_SPARSE):
+            bad.append(managed_archive('hosts', kind=kind))
+        buffer = BytesIO()
+        with tarfile.open(fileobj=buffer, mode='w') as archive:
+            for _ in range(2):
+                archive.addfile(tarfile.TarInfo('hosts'))
+        bad.append(buffer.getvalue())
+        buffer = BytesIO()
+        with tarfile.open(fileobj=buffer, mode='w', format=tarfile.PAX_FORMAT) as archive:
+            member = tarfile.TarInfo('hosts')
+            member.pax_headers = {'comment': SECRET}
+            archive.addfile(member)
+        bad.append(buffer.getvalue())
+        for raw in bad:
+            c.client._transport = lambda path: raw
+            with self.subTest(type=type(raw)), self.assertRaises(runtime.RuntimeCollectionError) as caught:
+                c.client.managed_file(CID, 'hosts')
+            self.assertNotIn(SECRET, str(caught.exception))
+        for content in (b'', b'x' * runtime.MAX_MANAGED_FILE):
+            c.client._transport = lambda path: managed_archive('hosts', content)
+            self.assertEqual(c.client.managed_file(CID, 'hosts'), content)
+
+    def test_history_requires_separate_earlier_collector_issuance(self):
+        c, _ = collector()
+        earlier = c.collect()
+        baseline = c.collect()
+        later = c.collect()
+        self.assertIs(c.validate_history(earlier, before=baseline), earlier)
+        for history in (baseline, later, replace(earlier)):
+            with self.assertRaises(runtime.RuntimeCollectionError):
+                c.validate_history(history, before=baseline)
+        with self.assertRaises(runtime.RuntimeCollectionError):
+            c.validate_history(earlier, before=replace(baseline))
+        with mock.patch.object(runtime.time, 'monotonic', return_value=c._issued[id(earlier)][1]):
+            same_time = c.collect()
+        with self.assertRaises(runtime.RuntimeCollectionError):
+            c.validate_history(earlier, before=same_time)
 
     def test_independent_exports(self):
         c, _ = collector()
@@ -404,7 +528,7 @@ class RuntimeTests(unittest.TestCase):
             connection.sock.getpeercert.return_value = certificate
             response = connection.getresponse.return_value
             response.status = 200
-            response.read.return_value = b'{"ID":"fixture-daemon"}'
+            response.read1.side_effect = [b'{"ID":"fixture-daemon"}', b'']
             client = runtime.DockerTLSClient(matching, ca_file=Path('ca'), cert_file=Path('cert'), key_file=Path('key'))
             self.assertEqual(client.get('/v1.45/info'), {'ID': 'fixture-daemon'})
             runtime.ssl.create_default_context.assert_called_once_with(cafile='ca')
@@ -423,6 +547,33 @@ class RuntimeTests(unittest.TestCase):
                 client.get('/v1.45/info')
             connection.request.assert_not_called()
             connection.close.assert_called_once()
+
+    def test_production_managed_archive_uses_pinned_bounded_binary_get(self):
+        certificate = b'fixture-DER'
+        p = policy(server_certificate_sha256=hashlib.sha256(certificate).hexdigest())
+        route = '/v1.45/containers/' + CID + '/archive?path=%2Fetc%2Fhosts'
+        with mock.patch.object(runtime.ssl, 'create_default_context'), \
+                mock.patch.object(runtime.http.client, 'HTTPSConnection') as connection_type:
+            connection = connection_type.return_value
+            connection.sock.getpeercert.return_value = certificate
+            response = connection.getresponse.return_value
+            response.status = 200
+            response.read1.side_effect = [managed_archive('hosts', SECRET.encode()), b'']
+            client = runtime.DockerTLSClient(p, ca_file=Path('ca'), cert_file=Path('cert'), key_file=Path('key'))
+            self.assertEqual(client.managed_file(CID, 'hosts'), SECRET.encode())
+            connection.request.assert_called_once_with('GET', route, headers={'Accept': 'application/x-tar'})
+            self.assertEqual(response.read1.call_args_list[0], mock.call(65536))
+            connection.close.assert_called_once()
+            connection.reset_mock()
+            connection.sock.getpeercert.return_value = b'wrong'
+            with self.assertRaises(runtime.RuntimeCollectionError):
+                client.managed_file(CID, 'hosts')
+            connection.request.assert_not_called()
+            connection.close.assert_called_once()
+            connection.sock.getpeercert.return_value = certificate
+            response.read1.side_effect = [b'x' * (runtime.MAX_RESPONSE + 1)]
+            with self.assertRaises(runtime.RuntimeCollectionError):
+                client.managed_file(CID, 'hosts')
 
     def test_cli_status_and_collect_fail_closed(self):
         for action, status in (('status', 0), ('collect', 1)):
@@ -471,7 +622,8 @@ class LocalTLSRuntimeTests(unittest.TestCase):
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):
                 calls.append(('GET', self.path, bool(self.connection.getpeercert())))
-                body = response_body if response_body is not None else json.dumps(fixture(self.path)).encode()
+                value = response_body if response_body is not None else fixture(self.path)
+                body = value if isinstance(value, bytes) else json.dumps(value).encode()
                 self.send_response(response_status)
                 self.send_header('Content-Type', 'application/json')
                 self.send_header('Content-Length', str(len(body)))
@@ -509,7 +661,7 @@ class LocalTLSRuntimeTests(unittest.TestCase):
             observation = c.collect()
             c.validate(observation)
         self.assertTrue(observation.to_dict()['complete'])
-        self.assertEqual(len(calls), 8)
+        self.assertEqual(len(calls), 14)
         self.assertTrue(all(method == 'GET' and authenticated for method, _, authenticated in calls))
         listed = [path for _, path, _ in calls if '/containers/json?' in path]
         from urllib.parse import parse_qs, urlsplit

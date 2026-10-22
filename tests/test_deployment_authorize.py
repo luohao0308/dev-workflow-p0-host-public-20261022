@@ -3,7 +3,10 @@ from dataclasses import FrozenInstanceError, asdict, replace
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
+import shutil
 import sys
+import subprocess
+import tempfile
 import threading
 import unittest
 from unittest import mock
@@ -35,10 +38,12 @@ class Approval:
             self.on_validate()
         return sdk.Grant('fixture:deployment', request.digest(), request.expires_at, 1)
 
-    def consume(self, grant, request):
+    def consume(self, grant, request, *, before_consume=None):
         self.calls.append('consume')
         if self.on_consume:
             self.on_consume()
+        if before_consume is not None:
+            before_consume()
         return sdk.Receipt(grant.grant_id, request.digest(), 1, datetime.now(timezone.utc).isoformat())
 
     def guard(self, request):
@@ -173,6 +178,38 @@ class DeploymentAuthorizeTests(unittest.TestCase):
             self.authorize(approval=None)
         self.assertEqual(self.audits(), [])
 
+    def test_cli_missing_authority_defaults_to_deny(self):
+        for action in ('authorize', 'execute'):
+            with self.subTest(action=action):
+                result = subprocess.run([sys.executable, '-I', str(Path(sdk.__file__)), action],
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn('Trusted deployment host required', json.loads(result.stderr)['error'])
+                self.assertEqual(result.stdout, '')
+
+    def test_isolated_standalone_bootstrap_prefers_trusted_core_in_both_layouts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            candidate = root / 'candidate'
+            candidate.mkdir()
+            (candidate / 'workflow_config.py').write_text('raise RuntimeError("untrusted import")\n')
+            installed = root / 'installed/scripts'
+            installed.mkdir(parents=True)
+            for source in (Path(sdk.__file__), Path(sdk.planner.__file__),
+                           ROOT / 'core/scripts/workflow_config.py', ROOT / 'core/scripts/workflow_lock.py'):
+                shutil.copyfile(source, installed / source.name)
+            for script, core in ((Path(sdk.__file__), ROOT / 'core/scripts'),
+                                 (installed / 'deployment_authorize.py', installed)):
+                code = ('import importlib.util, sys; sys.path.insert(0, sys.argv[2]); '
+                        'spec = importlib.util.spec_from_file_location("deployment_authorize", sys.argv[1]); '
+                        'module = importlib.util.module_from_spec(spec); sys.modules[spec.name] = module; '
+                        'spec.loader.exec_module(module); import workflow_config; print(workflow_config.__file__)')
+                with self.subTest(script=script):
+                    result = subprocess.run([sys.executable, '-I', '-c', code, str(script), str(candidate)],
+                                            capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(Path(result.stdout.strip()).resolve(), (core / 'workflow_config.py').resolve())
+
     def test_scope_mismatch_rejected(self):
         for changes in ({'repository_slug': 'other/repository'},):
             with self.subTest(changes=changes), self.assertRaises(sdk.AuthorizationError):
@@ -263,14 +300,66 @@ class DeploymentAuthorizeTests(unittest.TestCase):
         self.assertFalse(audit['authorizationConsumed'])
         self.assertEqual(self.approval.calls, ['validate', 'consume'])
 
-    def test_postconsume_drift_leaves_authority_spent(self):
+    def test_drift_inside_consumption_guard_records_unknown_outcome(self):
         self.approval.on_consume = lambda: self.docker.container['State'].update(Pid=999)
         with self.assertRaises(runtime.RuntimeCollectionError):
             self.authorize()
         audit, = self.audits()
+        self.assertEqual(audit['status'], 'consumption-unverified')
+        self.assertFalse(audit['authorizationConsumed'])
+        self.assertEqual(audit['failureCode'], 'consumption-rejected-or-unknown')
+        self.assertEqual(self.approval.calls.count('consume'), 1)
+
+    def test_runtime_drift_in_last_authority_reads_prevents_cas_and_retry(self):
+        from tests import test_deployment_host as host_fixtures
+        fixture = host_fixtures.DeploymentHostTests(methodName='runTest')
+        fixture.setUp()
+        fixture.req = self.request
+        fixture.policy = replace(fixture.policy, target_repository=self.request.repository_slug,
+                                 target_repository_id=self.request.repository_id,
+                                 deployment_target=self.request.target,
+                                 runtime_policy_hash=self.request.runtime_policy_hash)
+        fixture.client = fixture.client_for([self.request])
+        fixture.client.data.pop('/repos/sample/target')
+        fixture.client.data['/repos/' + self.request.repository_slug] = dict(
+            id=self.request.repository_id, full_name=self.request.repository_slug)
+        approval = fixture.make_host()
+        original = fixture.client.request
+        at_cas = False
+        def request(method, path, payload=None, **kwargs):
+            nonlocal at_cas
+            if method == 'POST':
+                at_cas = True
+            result = original(method, path, payload, **kwargs)
+            if at_cas and method == 'GET' and path.endswith('/approvals'):
+                self.docker.container['State']['Pid'] += 1
+            return result
+        with mock.patch.object(fixture.client, 'request', side_effect=request):
+            with self.assertRaises(host_fixtures.AuthorizationUnavailable):
+                self.authorize(approval=approval)
+        self.assertTrue(at_cas)
+        self.assertEqual(fixture.client.posts, 0)
+        self.assertIn(self.request.digest(), approval._consumed)
+        self.assertNotIn(self.request.digest(), approval._verified_consumptions)
+        with self.assertRaises(host_fixtures.AuthorizationUnavailable):
+            approval.consume(approval.validate(self.request), self.request)
+        self.assertEqual(fixture.client.posts, 0)
+        audit, = self.audits()
+        self.assertEqual(audit['status'], 'consumption-unverified')
+        self.assertFalse(audit['authorizationConsumed'])
+
+    def test_postconsume_drift_leaves_verified_authority_spent(self):
+        consume = self.approval.consume
+        def drift_after_receipt(grant, request, *, before_consume=None):
+            receipt = consume(grant, request, before_consume=before_consume)
+            self.docker.container['State']['Pid'] += 1
+            return receipt
+        with mock.patch.object(self.approval, 'consume', side_effect=drift_after_receipt):
+            with self.assertRaises(runtime.RuntimeCollectionError):
+                self.authorize()
+        audit, = self.audits()
         self.assertEqual(audit['status'], 'consumed-invalidated')
         self.assertTrue(audit['authorizationConsumed'])
-        self.assertEqual(audit['failureCode'], 'post-consumption-validation-failed')
         self.assertEqual(self.approval.calls.count('consume'), 1)
 
     def test_guard_rejection_invalidates_consumed_authority(self):
@@ -306,6 +395,27 @@ class DeploymentAuthorizeTests(unittest.TestCase):
         with self.assertRaises(runtime.RuntimeCollectionError):
             permit.claim_for_dispatch()
         self.assertEqual(self.approval.calls.count('consume'), 1)
+
+    def test_config_drift_during_last_collector_read_rejects_claim(self):
+        permit = self.authorize()
+        original = self.collector.recheck
+        guarded = False
+        def guard():
+            nonlocal guarded
+            guarded = True
+        def recheck(observation):
+            result = original(observation)
+            if guarded:
+                path = self.root / 'workflow.config.json'
+                path.write_text(path.read_text() + '\n')
+            return result
+        self.approval.on_guard = guard
+        with mock.patch.object(self.collector, 'recheck', side_effect=recheck):
+            with self.assertRaises(ValueError):
+                permit.claim_for_dispatch()
+        self.assertFalse(permit._claimed)
+        self.assertEqual(self.approval.calls.count('consume'), 1)
+        self.assertTrue(self.audits()[0]['authorizationConsumed'])
 
     def test_concurrent_claim_is_atomic(self):
         permit = self.authorize()
@@ -349,7 +459,8 @@ class DeploymentAuthorizeTests(unittest.TestCase):
     def test_rollback_requires_explicit_same_collector_history(self):
         history, values = self.rollback_setup()
         other, _ = collector(self.collector.policy, DockerFixture())
-        for proof in (None, history.to_dict(), history.snapshot(), replace(history), other.collect()):
+        for proof in (None, self.observation, history.to_dict(), history.snapshot(), replace(history), other.collect(),
+                      self.collector.collect()):
             with self.subTest(proof=type(proof)), self.assertRaises(ValueError):
                 sdk.build_request(self.root, self.plan, 'deployment-rollback', rollback_target=proof, **values)
         self.request = sdk.build_request(self.root, self.plan, 'deployment-rollback', rollback_target=history, **values)

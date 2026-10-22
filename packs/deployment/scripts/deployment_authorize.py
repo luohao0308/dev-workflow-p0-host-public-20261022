@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Scoped deployment/rollback authorization; no deployment executor is provided."""
+"""Scoped deployment/rollback authorization; no deployment executor is provided.
+
+Load from a pinned trusted checkout using an isolated Python bootstrap. Import
+paths below prioritize trusted siblings; the embedding host must also control
+preloaded modules and Python injection hooks.
+"""
 from __future__ import annotations
 
 import argparse
@@ -18,8 +23,9 @@ import uuid
 sys.dont_write_bytecode = True
 SCRIPT = Path(__file__).resolve()
 sys.path.insert(0, str(SCRIPT.parent))
-if len(SCRIPT.parents) > 3:
-    sys.path.append(str(SCRIPT.parents[3] / 'core/scripts'))
+CORE = SCRIPT.parents[3] / 'core/scripts' if len(SCRIPT.parents) > 3 else SCRIPT.parent
+# Installed packs and core helpers share <repository>/scripts.
+sys.path.insert(1, str(CORE if CORE.is_dir() else SCRIPT.parent))
 import deployment_prepare as planner
 from workflow_lock import LifecycleLock, pending_upgrades
 
@@ -170,7 +176,7 @@ def build_request(root, plan, operation, *, collector, observation, repository_s
     if operation == 'deployment-rollback':
         if rollback_target is None:
             raise AuthorizationError('Rollback requires an explicit authenticated historical target')
-        collector.validate_history(rollback_target)
+        collector.validate_history(rollback_target, before=observation)
         history = {item['name']: item for item in ordered(rollback_target.snapshot()['components'])}
         if set(history) != set(names):
             raise AuthorizationError('Rollback history does not cover the configured environment')
@@ -297,8 +303,12 @@ def authorize(root, plan, request, *, collector, observation, approval=None, rol
         collector.recheck(observation)
         validate_grant(grant, request)
         started = clock()
+        def before_consume():
+            collector.recheck(observation)
+            recheck()
+            validate_grant(grant, request)
         try:
-            receipt = approval.consume(grant, request)
+            receipt = approval.consume(grant, request, before_consume=before_consume)
             validate_receipt(receipt, grant, request, started)
         except Exception:
             result.update(status='consumption-unverified', failureCode='consumption-rejected-or-unknown')
@@ -312,8 +322,8 @@ def authorize(root, plan, request, *, collector, observation, approval=None, rol
             recheck()
             collector.recheck(observation)
             approval.guard(request)
-            recheck()
             collector.recheck(observation)
+            recheck()
             validate_grant(grant, request)
         try:
             final_check()

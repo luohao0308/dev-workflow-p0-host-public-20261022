@@ -4,6 +4,7 @@ on:
   push:
     branches: [master]
     tags-ignore: ["**"]
+    paths: ["core/**", "packs/**", "scripts/**", "tests/**", ".github/workflows/check.yml"]
   pull_request:
 
 jobs:

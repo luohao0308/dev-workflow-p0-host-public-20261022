@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Trusted, read-only Docker observations; exported JSON is never authority.
 
-Configuration projection v1 hashes (without exporting) the inspected Config,
-HostConfig, Path and Args. Config includes environment and command values; these
+Configuration projection v2 hashes (without exporting) the inspected Config,
+HostConfig, Path, Args, live networks, and Docker-managed file paths and bytes. Config includes environment and command values; these
 values, raw API responses and transport exceptions never appear in exports.
 Only an immutable-image/no-mount/read-only-root filesystem profile is complete.
 The host supplies catalog and TLS trust directly, never through project/CLI data.
@@ -14,12 +14,14 @@ from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 import hashlib
 import http.client
+from io import BytesIO
 import json
 from pathlib import Path
 import re
 import secrets
 import ssl
 import sys
+import tarfile
 import time
 from urllib.parse import urlencode, urlsplit
 
@@ -34,6 +36,8 @@ SEMVER = re.compile(r'(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)'
                     r'(?:\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?'
                     r'(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?\Z')
 MAX_RESPONSE = 8 * 1024 * 1024
+MAX_MANAGED_FILE = 65536
+MANAGED_FILES = {'hosts': 'HostsPath', 'hostname': 'HostnamePath', 'resolv.conf': 'ResolvConfPath'}
 
 
 class RuntimeCollectionError(ValueError):
@@ -178,7 +182,9 @@ def _catalog(policy):
 class DockerTLSClient:
     """Explicit mTLS, verified hostname and peer pin before every GET request.
 
-    transport(path) is a trusted embedding/test hook, never a CLI facility.
+    The fixed endpoint must sit behind trusted GET-only enforcement.
+    transport(path) is a trusted embedding/test hook, never a CLI facility;
+    archive routes return bytes and JSON routes return JSON-compatible values.
     """
     def __init__(self, policy, *, ca_file: Path, cert_file: Path, key_file: Path, timeout=10, transport=None):
         if (not isinstance(policy, RuntimePolicy) or type(timeout) not in (int, float)
@@ -204,14 +210,54 @@ class DockerTLSClient:
                 or re.fullmatch(r'/v1\.45/containers/[0-9a-f]{64}/json', path)
                 or re.fullmatch(r'/v1\.45/images/sha256:[0-9a-f]{64}/json', path)):
             raise RuntimeCollectionError('Docker read route refused')
+        try:
+            return parse_json(self._request(path, deadline=deadline).decode('utf-8'))
+        except Exception:
+            raise RuntimeCollectionError('Trusted Docker read failed') from None
+
+    def managed_file(self, container_id, name, *, deadline=None) -> bytes:
+        """Read only a fixed Docker-managed /etc file; never a host inspect path."""
+        if (not isinstance(container_id, str) or not CONTAINER.fullmatch(container_id)
+                or not isinstance(name, str) or name not in MANAGED_FILES):
+            raise RuntimeCollectionError('Docker managed file route refused')
+        path = '/v1.45/containers/' + container_id + '/archive?' + urlencode({'path': '/etc/' + name})
+        try:
+            raw = self._request(path, deadline=deadline, binary=True)
+            with tarfile.open(fileobj=BytesIO(raw), mode='r:') as archive:
+                member = archive.next()
+                if (member is None or member.name != name or not member.isreg()
+                        or member.type not in (tarfile.REGTYPE, tarfile.AREGTYPE)
+                        or member.linkname or member.sparse is not None or member.pax_headers
+                        or not 0 <= member.size <= MAX_MANAGED_FILE):
+                    raise ValueError
+                stream = archive.extractfile(member)
+                if stream is None:
+                    raise ValueError
+                with stream:
+                    content = stream.read(MAX_MANAGED_FILE + 1)
+                if len(content) != member.size or archive.next() is not None:
+                    raise ValueError
+            if deadline is not None and time.monotonic() >= deadline:
+                raise ValueError
+            return content
+        except Exception:
+            raise RuntimeCollectionError('Trusted Docker managed file read failed') from None
+
+    def _request(self, path, *, deadline=None, binary=False):
+        """Shared pinned mTLS request for internally allowlisted JSON/binary GETs."""
         connection = None
+        response = None
         try:
             remaining = self.timeout if deadline is None else min(self.timeout, deadline - time.monotonic())
             if remaining <= 0:
                 raise RuntimeCollectionError('Runtime capture deadline exceeded')
             if self._transport is not None:
                 # Round-trip to detach injected mutable objects and reject non-JSON values.
-                return parse_json(canonical(self._transport(path)))
+                value = self._transport(path)
+                raw = value if binary else canonical(value).encode()
+                if not isinstance(raw, bytes) or len(raw) > MAX_RESPONSE:
+                    raise RuntimeCollectionError('Runtime response exceeds limit')
+                return raw
             endpoint = urlsplit(self.policy.endpoint)
             connection = http.client.HTTPSConnection(endpoint.hostname, endpoint.port or 443,
                                                      timeout=remaining, context=self._context)
@@ -224,18 +270,31 @@ class DockerTLSClient:
                 if remaining <= 0:
                     raise RuntimeCollectionError('Runtime capture deadline exceeded')
                 connection.sock.settimeout(min(self.timeout, remaining))
-            connection.request('GET', path, headers={'Accept': 'application/json'})
+            connection.request('GET', path, headers={'Accept': 'application/x-tar' if binary else 'application/json'})
             response = connection.getresponse()
             if response.status != 200:
                 raise RuntimeCollectionError('Runtime read failed')
-            raw = response.read(MAX_RESPONSE + 1)
+            read_deadline = min(deadline if deadline is not None else float('inf'),
+                                time.monotonic() + self.timeout)
+            raw = bytearray()
+            while len(raw) <= MAX_RESPONSE:
+                remaining = read_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeCollectionError('Runtime read deadline exceeded')
+                connection.sock.settimeout(min(self.timeout, remaining))
+                chunk = response.read1(min(65536, MAX_RESPONSE + 1 - len(raw)))
+                if not chunk:
+                    break
+                raw.extend(chunk)
             if len(raw) > MAX_RESPONSE:
                 raise RuntimeCollectionError('Runtime response exceeds limit')
-            return parse_json(raw.decode('utf-8'))
+            return bytes(raw)
         except Exception:
             # Neither Docker error bodies nor paths/credentials from exceptions escape.
             raise RuntimeCollectionError('Trusted Docker read failed') from None
         finally:
+            if response is not None:
+                response.close()
             if connection is not None:
                 connection.close()
 
@@ -356,8 +415,34 @@ class TrustedDockerCollector:
                       and (not isinstance(image.get('RepoDigests'), list)
                            or entry['artifact']['ref'] not in image['RepoDigests']))):
                 raise RuntimeCollectionError('Observed image does not match trusted catalog')
-            projection = {'schemaVersion': 1, 'kind': 'docker-container-configuration',
-                          'Config': config, 'HostConfig': host, 'Path': container.get('Path'), 'Args': container.get('Args')}
+            if (not isinstance(host, dict) or host.get('Privileged') is not False
+                    or host.get('Devices') not in (None, []) or host.get('DeviceRequests') not in (None, [])
+                    or not isinstance(host.get('CapAdd'), (list, type(None)))
+                    or any(not isinstance(cap, str) or cap.upper().removeprefix('CAP_') in ('SYS_ADMIN', 'ALL')
+                           for cap in (host.get('CapAdd') or []))
+                    or any(not isinstance(host.get(field), str)
+                           or host[field] == 'host' or host[field].startswith('container:')
+                           for field in ('PidMode', 'IpcMode', 'NetworkMode'))):
+                incomplete.append('unsupported-isolation:' + name)
+            managed = {}
+            for filename, field in MANAGED_FILES.items():
+                inspect_path = container.get(field)
+                if (not isinstance(inspect_path, str) or not inspect_path.startswith('/')
+                        or inspect_path.startswith('//') or any(part in ('.', '..', '') for part in inspect_path[1:].split('/'))
+                        or any(ord(char) < 32 or ord(char) == 127 for char in inspect_path)):
+                    incomplete.append('managed-file-unknown:' + name)
+                    continue
+                content = self.client.managed_file(container['Id'], filename, deadline=deadline)
+                if time.monotonic() >= deadline:
+                    raise RuntimeCollectionError('Runtime capture deadline exceeded')
+                managed[filename] = {'inspectPath': inspect_path, 'sha256': hashlib.sha256(content).hexdigest()}
+            settings = container.get('NetworkSettings')
+            networks = settings.get('Networks') if isinstance(settings, dict) else None
+            if not isinstance(networks, dict):
+                incomplete.append('networks-unknown:' + name)
+            projection = {'schemaVersion': 2, 'kind': 'docker-container-configuration',
+                          'Config': config, 'HostConfig': host, 'Path': container.get('Path'), 'Args': container.get('Args'),
+                          'managedFiles': managed, 'Networks': networks}
             configuration = 'sha256:' + digest(projection)
             instances.append({'component': name, 'containerId': container['Id'], 'imageId': image_id,
                               'startedAt': state['StartedAt'], 'pid': state['Pid'], 'status': state['Status'],
@@ -413,7 +498,7 @@ class TrustedDockerCollector:
         except Exception:
             raise RuntimeCollectionError('Runtime evidence could not be collected') from None
 
-    def validate_history(self, observation):
+    def validate_history(self, observation, *, before=None):
         record = self._issued.get(id(observation))
         if (not isinstance(observation, RuntimeObservation) or record is None or record[0] is not observation
                 or observation.policy_hash != self._policy_hash or self.policy.identity_hash() != self._policy_hash
@@ -421,6 +506,10 @@ class TrustedDockerCollector:
             raise RuntimeCollectionError('Runtime observation was not issued by this collector and scope')
         if observation.to_dict().get('complete') is not True:
             raise RuntimeCollectionError('Runtime observation is incomplete')
+        if before is not None:
+            self.validate_history(before)
+            if observation is before or record[1] >= self._issued[id(before)][1]:
+                raise RuntimeCollectionError('Runtime history must precede the baseline observation')
         return observation
 
     def validate(self, observation):

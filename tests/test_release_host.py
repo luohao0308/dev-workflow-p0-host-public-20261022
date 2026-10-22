@@ -124,6 +124,65 @@ class ReleaseHostTests(unittest.TestCase):
         self.assertIs(type(receipt), host.Receipt)
         self.assertTrue(next(iter(self.client.markers)).startswith('tags/workflow-grants/123/'))
 
+    def test_before_consume_runs_after_last_authority_reads_at_before_send(self):
+        approval = self.make_host()
+        grant = approval.validate(self.req)
+        events = []
+        original = self.client.request
+        def request(method, path, payload=None, **kwargs):
+            if method == 'GET':
+                events.append('authority')
+            return original(method, path, payload, **kwargs)
+        def guard():
+            self.assertEqual(self.client.posts, 0)
+            self.assertEqual(events[-1], 'authority')
+            events.append('sdk')
+        with mock.patch.object(self.client, 'request', side_effect=request):
+            approval.consume(grant, self.req, before_consume=guard)
+        self.assertEqual(events[-1], 'sdk')
+        self.assertEqual(self.client.posts, 1)
+
+    def test_before_send_guard_failure_never_posts_or_refunds_attempt(self):
+        approval = self.make_host()
+        grant = approval.validate(self.req)
+        original = self.client.request
+        state = {'runtime': 'approved'}
+        def request(method, path, payload=None, **kwargs):
+            value = original(method, path, payload, **kwargs)
+            if method == 'GET' and path.endswith('/approvals'):
+                state['runtime'] = 'drifted'
+            return value
+        def guard():
+            if state['runtime'] != 'approved':
+                raise RuntimeError('runtime changed during authority reads')
+        with mock.patch.object(self.client, 'request', side_effect=request):
+            with self.assertRaises(AuthorizationUnavailable):
+                approval.consume(grant, self.req, before_consume=guard)
+        self.assertEqual(self.client.posts, 0)
+        self.assertIn(self.req.digest(), approval._consumed)
+        self.assertNotIn(self.req.digest(), approval._verified_consumptions)
+        with self.assertRaises(AuthorizationUnavailable):
+            approval.consume(grant, self.req)
+        with self.assertRaises(AuthorizationUnavailable):
+            approval.guard(self.req)
+        self.assertEqual(self.client.posts, 0)
+
+    def test_callback_expiry_rejected_without_post_or_refund(self):
+        approval = self.make_host()
+        grant = approval.validate(self.req)
+        def guard():
+            approval._expires = 0
+        with self.assertRaises(AuthorizationUnavailable):
+            approval.consume(grant, self.req, before_consume=guard)
+        self.assertEqual(self.client.posts, 0)
+        self.assertIn(self.req.digest(), approval._consumed)
+
+    def test_noncallable_consumption_guard_denied(self):
+        approval = self.make_host()
+        with self.assertRaises(AuthorizationUnavailable):
+            approval.consume(approval.validate(self.req), self.req, before_consume=True)
+        self.assertEqual(self.client.posts, 0)
+
     def test_request_subclasses_cannot_replace_frozen_domain(self):
         class OtherRequest(Request):
             pass

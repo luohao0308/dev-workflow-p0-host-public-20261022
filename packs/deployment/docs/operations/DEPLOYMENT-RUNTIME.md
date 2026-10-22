@@ -14,13 +14,13 @@ GitHub 授权宿主复用完整可信分发的 release 基础模块；这是分�
 
 `RuntimePolicy` 固定 HTTPS origin、服务端 DER 证书 SHA-256 pin、daemon ID、仓库 `owner/name`、环境、目标、production、Compose project、完整组件集合和可信 catalog。默认 observation 最大年龄 3600 秒、采集期限 30 秒；策略身份哈希绑定全部字段。
 
-`DockerTLSClient` 使用显式 CA、客户端证书和私钥，校验主机名与服务端证书链，在发送 GET 前验证 peer pin。每轮读取 `/v1.45/info` 并校验 daemon ID；客户端只允许固定 `/v1.45` info、容器列表/inspect、镜像 inspect GET 路由，不使用重定向、代理或环境凭据发现。部署方还必须配置服务端强制 GET 路由白名单的 mTLS 只读网关/授权层。客户端证书直接访问原始 Docker daemon 并不天然只读，客户端路由限制不能代替服务端权限约束。
+`DockerTLSClient` 使用显式 CA、客户端证书和私钥，校验主机名与服务端证书链，在发送 GET 前验证 peer pin。每轮读取 `/v1.45/info` 并校验 daemon ID；客户端只允许固定 `/v1.45` info、容器列表/inspect、镜像 inspect，以及固定 `/etc/hosts`、`/etc/hostname`、`/etc/resolv.conf` 的只读 archive GET 路由，不使用重定向、代理或环境凭据发现。部署方还必须配置服务端强制 GET 路由白名单的 mTLS 只读网关/授权层。客户端证书直接访问原始 Docker daemon 并不天然只读，客户端路由限制不能代替服务端权限约束。
 
 Compose project/service labels 仅用于选择成员，不证明来源、版本或产物身份。每组件必须恰好一个 running、未 paused/restarting/dead 的容器；实际容器 `.Image` 必须等于镜像 inspect 的不可变 `Id`。可信 catalog 由宿主维护，schema v1 的每项绑定 component、imageId、repository、完整 sourceSha、语义版本、os、architecture、artifact 和 migration。实际平台必须匹配；local-build 的 imageId/buildSourceSha 必须匹配 catalog，registry 引用必须精确出现在实际 RepoDigests。来源 SHA 是可信 catalog 对实测镜像的绑定，不从 labels 或目标清单补造。缺失 catalog、未知来源或迁移不能借用目标值。
 
-首个完整 profile 仅支持不可变镜像、`ReadonlyRootfs=true`、无 bind/volume/tmpfs 等挂载和镜像外配置文件、无数据库、无需迁移的工作负载；catalog 必须显式声明 `migration.mode=none`。未知迁移或不支持的文件系统产生 `complete=false`，无可用 snapshot/授权；数据库、备份、恢复和迁移能力未由此交付。
+首个完整 profile 仅支持不可变镜像、`ReadonlyRootfs=true`、无 bind/volume/tmpfs 等挂载及其他镜像外配置依赖、无特权/设备/共享宿主命名空间、无数据库、无需迁移的工作负载；catalog 必须显式声明 `migration.mode=none`。未知迁移或不支持的文件系统产生 `complete=false`，无可用 snapshot/授权；数据库、备份、恢复和迁移能力未由此交付。
 
-在期限内进行两轮完整读取，包含两次 daemon 校验，结果必须相等。这证明两次读取稳定，不是跨 Docker API 的原子快照，不能排除读取之间变化后恢复。配置摘要为版本化 canonical 投影：`schemaVersion=1`、`kind=docker-container-configuration`、inspect 的 `Config`、`HostConfig`、`Path`、`Args`。Env 等私密值参与哈希但不导出；摘要不加密，仍需限制访问。输出不含原始 Env/Config/HostConfig、凭据、原始 API 响应或异常。
+在期限内进行两轮完整读取，包含两次 daemon 校验，结果必须相等。这证明两次读取稳定，不是跨 Docker API 的原子快照，不能排除读取之间变化后恢复。配置摘要为版本化 canonical 投影：`schemaVersion=2`、`kind=docker-container-configuration`、inspect 的 `Config`、`HostConfig`、`Path`、`Args`、实际网络连接和三个 Docker 管理文件的内容摘要。管理文件通过固定路径的只读 archive 获取，仅接受有大小上限的普通文件；不解压到宿主文件系统，也不把路径存在当作内容证明。Env 等私密值参与哈希但不导出；摘要不加密，仍需限制访问。输出不含原始 Env/Config/HostConfig、凭据、原始 API 响应或异常。
 
 | 身份 | 含义 |
 |---|---|
@@ -35,13 +35,13 @@ Compose project/service labels 仅用于选择成员，不证明来源、版本�
 
 `build_request` 先重新检查 prepared plan、仓库准确根目录、HEAD、配置、命令引用/cwd 和输入字节，再要求同一 collector 签发的新鲜完整 observation，覆盖配置环境的全部组件。计划基线的 runtime version、完整映射及输入 snapshot 必须与该 observation 一致。before/after 保留全部组件，未选择组件身份不变；当前 profile 拒绝需要备份或迁移的请求。
 
-首次 after/目标清单是审核通过的期望声明，不是目标产物已验证或已运行证明。P1-3 执行器后续才负责核验目标产物并实际 dispatch。回滚另需显式 `rollback_target`：同一 collector 在内存中保留、范围一致的完整历史 observation；历史目标可过新鲜期，当前基线必须新鲜。按当前基线重新规划，目标选中组件匹配该历史证明，不能简单反转旧 deploy permit，也不接受任意历史 JSON。
+首次 after/目标清单是审核通过的期望声明，不是目标产物已验证或已运行证明。P1-3 执行器后续才负责核验目标产物并实际 dispatch。回滚另需显式 `rollback_target`：同一 collector 在内存中保留、范围一致的完整历史 observation，签发顺序必须严格早于当前 observation 且不是同一个对象；历史目标可过新鲜期，当前基线必须新鲜。按当前基线重新规划，目标选中组件匹配该历史证明，不能简单反转旧 deploy permit，也不接受任意历史 JSON。
 
 Request 固定 operation（`deployment-deploy` / `deployment-rollback`）、仓库路径/slug/ID、HEAD、配置哈希、环境/target/production、组件、完整 before/after、条件与证据、plan/observation/state/runtime policy 哈希、有效期和 `max_uses=1`。有效期不超过一小时；Grant/Receipt 必须为部署类型且匹配请求摘要、次数和期限。域为 `dev-workflow-deployment-authorization-v1`，GitHub audience 为 `dev-workflow-deployment-host`，grant namespace 为 `github-deployment`，独立账本 namespace 为 `workflow-deployment-grants`；release 请求、审批和凭据不能跨域使用。
 
 `DeploymentHostPolicy.environment` 是签名 OIDC 调用者环境，`approval_environment` 是受保护人工审核环境；两者可相同，也可分开以便只读 observer 持续运行并保留历史。部署环境/target/production、runtime policy hash、允许组件另行固定。宿主核验 OIDC 签名/issuer/audience/subject、仓库身份、workflow ref/SHA、run ID、首次 attempt、调用者环境与 actor；运行须为进行中的 workflow_dispatch。受保护审核环境、reviewer ID、自审规则和禁止管理员绕过规则必须匹配，审批评论精确为 `dev-workflow approve <bundle_hash>`。bundle 摘要绑定全部宿主策略上下文、请求集合和到期时间，不能只审目标业务版本或另一环境的审批。沿用用户已有明确授权，不重复索要相同权限；对话授权不替代这些宿主核验。
 
-`authorize` 在消耗前和返回 permit 前重核项目/计划、现场 observation 与宿主权限。宿主在目标项目之外的可信账本，以只允许不存在时创建 ref 的 CAS 语义记录一次消耗；重复、响应丢失或结果未知均按次数已消耗处理，停止，不退款、不自动重试/恢复。消耗后漂移也不恢复次数。最终 guard 再验证实时授权和账本；进程内 `DeploymentPermit.claim_for_dispatch()` 仅允许一次 claim，当前无执行器调用它。任何不确定调度须先核对现场和账本，再另行构建新请求，不能从旧文件自动续跑。
+`authorize` 在消耗前和返回 permit 前重核项目/计划、现场 observation 与宿主权限；完成远端权限查询后，紧邻账本 CAS 再执行运行状态和项目 guard。dispatch claim 的最后一次现场读取后再检查项目/计划。跨 Git、Docker 和 GitHub 的检查仍不构成原子事务，未来执行器需要衔接后端幂等及状态核对。宿主在目标项目之外的可信账本，以只允许不存在时创建 ref 的 CAS 语义记录一次消耗；重复、响应丢失或结果未知均按次数已消耗处理，停止，不退款、不自动重试/恢复。消耗后漂移也不恢复次数。最终 guard 再验证实时授权和账本；进程内 `DeploymentPermit.claim_for_dispatch()` 仅允许一次 claim，当前无执行器调用它。任何不确定调度须先核对现场和账本，再另行构建新请求，不能从旧文件自动续跑。
 
 本机审计保存于 Git 忽略且无已跟踪内容的 `.dev-workflow/releases/deployments/`，文件权限为私有；JSON、Receipt 导出和 `authorizationConsumed=true` 只说明审计/消耗结果，不是可加载的执行 capability，也不是部署成功证明。
 

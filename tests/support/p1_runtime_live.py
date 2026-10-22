@@ -72,6 +72,7 @@ def bridge(directory):
         def do_GET(self):
             allowed = (self.path == '/v1.45/info' or self.path.startswith('/v1.45/containers/json?')
                        or re.fullmatch(r'/v1\.45/containers/[0-9a-f]{64}/json', self.path)
+                       or re.fullmatch(r'/v1\.45/containers/[0-9a-f]{64}/archive\?path=%2Fetc%2F(?:hosts|hostname|resolv\.conf)', self.path)
                        or re.fullmatch(r'/v1\.45/images/sha256:[0-9a-f]{64}/json', self.path))
             if not allowed:
                 self.send_error(403)

@@ -334,7 +334,10 @@ class GitHubActionsApproval:
         expires = datetime.fromtimestamp(self._grant_expiry(request), timezone.utc).isoformat()
         return self.grant_type(self.grant_namespace + ':' + str(self.policy.run_id) + ':' + request.operation, request.digest(), expires, 1)
 
-    def consume(self, grant, request):
+    def consume(self, grant, request, *, before_consume=None):
+        """Consume once, optionally checking a trusted SDK guard at the CAS edge."""
+        if before_consume is not None and not callable(before_consume):
+            _deny('Consumption guard must be callable')
         with self._lock:
             expected = self.validate(request)
             if type(grant) is not self.grant_type or grant != expected or request.digest() in self._consumed:
@@ -342,9 +345,17 @@ class GitHubActionsApproval:
             marker = 'refs/tags/' + self.ledger_namespace + '/' + str(self.policy.run_id) + '/' + self.bundle_hash + '/' + request.operation
             # No automatic retry: both a duplicate and a lost response deny dispatch.
             self._consumed.add(request.digest())
+            def before_send():
+                self._check_authority()
+                if before_consume is not None:
+                    before_consume()
+                # All blocking authority and SDK reads precede these local checks.
+                self._match(request)
+                if time.time() >= min(self._grant_expiry(request), timestamp(grant.expires_at).timestamp()):
+                    _deny('Authorization expired before grant consumption')
             try:
                 value, _headers = self.client.request('POST', '/repos/' + self.policy.ledger_repository + '/git/refs',
-                                            {'ref': marker, 'sha': self.policy.ledger_sha}, before_send=self._check_authority)
+                                            {'ref': marker, 'sha': self.policy.ledger_sha}, before_send=before_send)
             except Exception:
                 _deny('Durable grant consumption rejected or outcome unknown')
             if not isinstance(value, dict) or value.get('ref') != marker or value.get('object', {}).get('sha') != self.policy.ledger_sha:
