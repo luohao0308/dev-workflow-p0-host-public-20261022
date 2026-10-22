@@ -237,6 +237,14 @@ def main():
                 time.sleep(5)
             else:
                 raise ValueError('Scoped human environment approval timed out')
+            for _ in range(12):
+                active, _ = gh.request('GET', '/repos/' + metadata['hostRepository']
+                                       + '/actions/runs/' + os.environ['GITHUB_RUN_ID'])
+                if active.get('status') == 'in_progress':
+                    break
+                time.sleep(2)
+            else:
+                raise ValueError('Reviewed workflow is not actively running')
             approval = host.GitHubDeploymentApproval(gh, oidc(), [request], hostpolicy)
             permit = sdk.authorize(candidate, plan, request, collector=collector, observation=observation,
                                    approval=approval, rollback_target=history)

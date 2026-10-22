@@ -93,7 +93,24 @@ jobs:
     environment: p1-deploy-approval
     steps:
       - run: echo 'Deployment authorization review recorded; no backend connected'
+  rollback-ready:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      actions: read
+    steps:
+      - name: Start rollback gate only after its fresh preview exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for attempt in $(seq 1 260); do
+            found=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" --jq '[.artifacts[] | select(.name == "p1-rollback-preview")] | length')
+            if [ "$found" = 1 ]; then exit 0; fi
+            sleep 10
+          done
+          exit 1
   rollback-review:
+    needs: rollback-ready
     runs-on: ubuntu-latest
     timeout-minutes: 5
     environment: p1-rollback-approval
