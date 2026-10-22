@@ -12,6 +12,7 @@ from datetime import timedelta
 import hashlib
 import http.client
 import json
+import math
 from pathlib import Path
 import re
 import secrets
@@ -78,7 +79,7 @@ class DockerMutationClient:
     authenticated connection. Production always connects and pins before guarding.
     """
     def __init__(self, policy, *, ca_file: Path, cert_file: Path, key_file: Path,
-                 timeout=10, transport=None):
+                 timeout=30, transport=None):
         if (type(policy) is not ExecutionPolicy or type(timeout) not in (int, float)
                 or not 0 < timeout <= 300):
             raise ExecutionError('invalid-writer-policy')
@@ -153,19 +154,30 @@ class DockerMutationClient:
         except Exception:
             raise ExecutionError('writer-payload-rejected') from None
         connection = response = None
+        timeout = max(self.timeout, self.policy.stop_timeout + 5) if '/stop?' in path else self.timeout
+        timeout = min(timeout, self.policy.execution_deadline)
+        absolute_deadline = None
         attempted = False
         phase = 'writer-connect-failed'
         try:
             if self._transport is None:
                 endpoint = urlsplit(self.policy.runtime_policy.endpoint)
                 connection = http.client.HTTPSConnection(endpoint.hostname, endpoint.port or 443,
-                                                         context=self._context, timeout=self.timeout)
+                                                         context=self._context, timeout=timeout)
                 connection.connect()
                 certificate = connection.sock.getpeercert(binary_form=True)
                 if hashlib.sha256(certificate).hexdigest() != self.policy.runtime_policy.server_certificate_sha256:
                     raise ExecutionError('writer-peer-pin-rejected')
             phase = 'execution-guard-rejected'
-            before_send()
+            supplied_deadline = before_send()
+            if type(supplied_deadline) in (int, float):
+                remaining = supplied_deadline - time.monotonic()
+                if not math.isfinite(supplied_deadline) or remaining <= 0:
+                    raise ExecutionError('execution-deadline-exceeded')
+                absolute_deadline = supplied_deadline
+                timeout = min(timeout, remaining)
+                if connection is not None and connection.sock is not None:
+                    connection.sock.settimeout(timeout)
             phase = 'writer-response-unknown'
             attempted = True
             if self._transport is not None:
@@ -177,7 +189,8 @@ class DockerMutationClient:
                 response = connection.getresponse()
                 status = response.status
                 # Bounded overall response read, including slow streaming peers.
-                deadline = time.monotonic() + self.timeout
+                deadline = min(time.monotonic() + timeout,
+                               absolute_deadline if absolute_deadline is not None else float('inf'))
                 raw = bytearray()
                 while len(raw) <= MAX_BODY:
                     remaining = deadline - time.monotonic()
@@ -293,6 +306,18 @@ class DockerExecutor:
             if (container.get('Id') != cid or labels != item.get('Labels')
                     or labels.get('com.docker.compose.project') != self.policy.runtime_policy.project):
                 raise ExecutionError('inventory-scope-changed')
+            # Inspect paths alone do not prove Docker-managed file contents.
+            # Newly created / stopped containers have no active configuration;
+            # active unselected instances must retain their exact file bytes.
+            managed = None
+            if container.get('State', {}).get('Running') is True:
+                managed = {}
+                for name in runtime.MANAGED_FILES:
+                    if time.monotonic() >= deadline:
+                        raise ExecutionError('execution-deadline-exceeded')
+                    content = reader.managed_file(cid, name, deadline=deadline)
+                    managed[name] = hashlib.sha256(content).hexdigest()
+            container['_workflowManagedFiles'] = managed
             result[cid] = container
         return result
 
@@ -472,6 +497,7 @@ class DockerExecutor:
         result = dict(schemaVersion=1, kind='deployment-execution-result', profile=PROFILE,
                       policyHash=self._policy_hash, intentId=binding['intentId'], requestHash=request.digest(),
                       operation=request.operation, component=binding['component'], resourceName=binding['resourceName'],
+                      imageId=binding['imageId'], specHash=binding['specHash'],
                       beforeContainerId=binding['beforeContainerId'], containerId=None,
                       executionAvailable=True, productionReady=False, status='pending', execution='not-performed',
                       authorizationConsumed=True, reconcileRequired=False, actions=[], lastAction=None,
@@ -480,7 +506,7 @@ class DockerExecutor:
         with LifecycleLock(root, 'deployment-execution'):
             if pending_upgrades(root):
                 raise ExecutionError('unfinished-upgrade')
-            sdk._audit(root, relative, result)
+            sdk._assert_output(root, relative)
             with self._lock:
                 if record['used']:
                     raise ExecutionError('intent-already-dispatched')
@@ -490,6 +516,7 @@ class DockerExecutor:
             stage, new_id, attempted, completed = 0, None, False, 0
             deadline = time.monotonic() + self.policy.execution_deadline
             try:
+                sdk._audit(root, relative, result)
                 permit.claim_for_dispatch()
                 for action in binding['actions']:
                     result['lastAction'] = action
@@ -502,6 +529,7 @@ class DockerExecutor:
                         action_record['status'] = 'dispatch-attempted'
                         sdk._audit(root, relative, result)
                         permit.guard_for_execution(runtime_check=lambda: self._stage(record, stage, new_id, deadline))
+                        return deadline
                     try:
                         if action == 'create':
                             response = self.client.create(binding['resourceName'],

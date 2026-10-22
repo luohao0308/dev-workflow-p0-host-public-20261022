@@ -40,6 +40,7 @@ class MutableDocker:
         self.writes, self.reads = [], []
         self.entries = []
         self.sequence = 0
+        self.managed_files = {}
         self.on_write = self.on_read = None
         self.daemon_id = 'synthetic-daemon'
         for component, digit in (('web', 'a'), ('web', 'b'), ('api', 'c')):
@@ -93,7 +94,7 @@ class MutableDocker:
             return deepcopy(self.containers[cid])
         if route.endswith('/archive'):
             filename = parse_qs(urlsplit(path).query)['path'][0].split('/')[-1]
-            return managed_archive(filename, b'fixed synthetic managed file')
+            return managed_archive(filename, self.managed_files.get((cid, filename), b'fixed synthetic managed file'))
         raise AssertionError('Read route refused')
 
     def write(self, method, path, body):
@@ -177,6 +178,58 @@ class DeploymentExecuteTests(unittest.TestCase):
 
     def audits(self):
         return [json.loads(path.read_text()) for path in (self.root / sdk.RECORDS).glob('execution-*.json')]
+
+    def test_unselected_managed_file_drift_stops_before_next_write(self):
+        permit = self.authorize()
+        def change(method, path, body):
+            if '/containers/create?' in path:
+                self.docker.managed_files[(API, 'hosts')] = b'changed after authorization'
+        self.docker.on_write = change
+        result = self.engine.execute(self.root, permit, self.intent)
+        self.assertEqual(len(self.docker.writes), 1)
+        self.assertEqual(result['status'], 'executed-unverified')
+        self.assertTrue(result['reconcileRequired'])
+        self.assertTrue(self.docker.containers[OLD]['State']['Running'])
+
+    def test_delayed_concurrent_replay_preserves_completed_journal(self):
+        permit = self.authorize()
+        ready, finished = threading.Event(), threading.Event()
+        errors = []
+        original = self.engine._validate_intent
+        def delayed(*args, **kwargs):
+            original(*args, **kwargs)
+            if threading.current_thread().name == 'delayed-replay':
+                ready.set()
+                if not finished.wait(30):
+                    raise AssertionError('Replay coordination timed out')
+        def replay():
+            try:
+                self.engine.execute(self.root, permit, self.intent)
+            except Exception as error:
+                errors.append(error)
+        with mock.patch.object(self.engine, '_validate_intent', side_effect=delayed):
+            thread = threading.Thread(target=replay, name='delayed-replay')
+            thread.start()
+            try:
+                self.assertTrue(ready.wait(10))
+                result = self.engine.execute(self.root, permit, self.intent)
+                self.assertEqual(result['status'], 'executed-verified')
+                path, = (self.root / sdk.RECORDS).glob('execution-*.json')
+                evidence = path.read_bytes()
+            finally:
+                finished.set()
+                thread.join(10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(path.read_bytes(), evidence)
+        self.assertEqual(len(self.docker.writes), 4)
+
+    def test_expired_send_budget_refuses_before_dispatch(self):
+        for deadline in (backend.time.monotonic() - 1, float('nan')):
+            with self.subTest(deadline=deadline), self.assertRaises(backend.ExecutionError) as caught:
+                self.client.start(OLD, before_send=lambda: deadline)
+            self.assertFalse(caught.exception.may_have_mutated)
+        self.assertEqual(self.docker.writes, [])
 
     def test_actual_issuance_deploy_then_fresh_rollback_preserves_api_instance(self):
         history = self.observation

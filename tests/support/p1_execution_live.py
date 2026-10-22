@@ -37,8 +37,15 @@ from release_host import bundle_digest
 from release_host_runner import bootstrap
 
 
+class FixtureDocker(UnixDocker):
+    def connect(self):
+        super().connect()
+        # Docker stop(t=10) can legitimately need slightly more than 10 seconds.
+        self.sock.settimeout(45)
+
+
 def docker(method, path, value=None):
-    connection = UnixDocker('localhost')
+    connection = FixtureDocker('localhost')
     try:
         body = None if value is None else json.dumps(value).encode()
         connection.request(method, path, body=body, headers={'Content-Type': 'application/json'})
