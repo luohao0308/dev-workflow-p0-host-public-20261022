@@ -58,9 +58,10 @@ def _start_identity_matches(previous, current, fields):
         return False
     before_host, after_host = dict(previous['HostConfig']), dict(current['HostConfig'])
     if ('OomKillDisable' in before_host and 'OomKillDisable' in after_host
-            and before_host['OomKillDisable'] is None and after_host['OomKillDisable'] is False):
-        before_host['OomKillDisable'] = False
-    if before_host != after_host:
+            and (before_host['OomKillDisable'] is None or before_host['OomKillDisable'] is False)
+            and (after_host['OomKillDisable'] is None or after_host['OomKillDisable'] is False)):
+        before_host['OomKillDisable'] = after_host['OomKillDisable'] = False
+    if runtime.canonical(before_host) != runtime.canonical(after_host):
         return False
     for filename, key in runtime.MANAGED_FILES.items():
         before, after = previous.get(key), current.get(key)

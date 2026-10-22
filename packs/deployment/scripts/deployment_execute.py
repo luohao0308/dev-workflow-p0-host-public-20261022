@@ -206,6 +206,11 @@ class DockerMutationClient:
                     raise ExecutionError('writer-gate-policy-mismatch')
             elif host_operation is not None:
                 raise ExecutionError('unexpected-host-operation')
+            # Header issuance may acquire the durable gate mutex. Finish all
+            # filesystem work before the last authority/runtime guard.
+            headers = {'Content-Type': 'application/json', 'Accept': 'application/json'}
+            if session is not None:
+                headers.update(WriterSession.headers(session, attempt))
             phase = 'execution-guard-rejected'
             supplied_deadline = before_send()
             if type(supplied_deadline) in (int, float):
@@ -216,9 +221,6 @@ class DockerMutationClient:
                 timeout = min(timeout, remaining)
                 if connection is not None and connection.sock is not None:
                     connection.sock.settimeout(timeout)
-            headers = {'Content-Type': 'application/json', 'Accept': 'application/json'}
-            if session is not None:
-                headers.update(WriterSession.headers(session, attempt))
             phase = 'writer-response-unknown'
             attempted = True
             if self._transport is not None:

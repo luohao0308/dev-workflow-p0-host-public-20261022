@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 from urllib.parse import urlsplit
 
 from tests import test_deployment_verification as verification
@@ -86,6 +87,26 @@ class HostOperationTests(unittest.TestCase):
         self.assertEqual(self.fixture.original_api, self.f.docker.containers[fixtures.API])
         with self.assertRaises(recovery.RecoveryError):
             recovery.HostOperation.validate_writer(operation, self.f.policy)
+
+    def test_header_lock_delay_cannot_dispatch_after_grant_expiry(self):
+        original_headers = gateway.WriterSession.headers
+        original_clock = fixtures.sdk.clock
+        offset = fixtures.timedelta()
+        def clock():
+            return original_clock() + offset
+        def delayed_headers(session, attempt):
+            nonlocal offset
+            value = original_headers(session, attempt)
+            offset = fixtures.timedelta(hours=2)
+            return value
+        with self.coordinator.operation(self.f.root, self.f.plan, self.f.intent) as operation:
+            permit = self.authorize(operation)
+            with mock.patch.object(gateway.WriterSession, 'headers', new=delayed_headers), \
+                    mock.patch.object(fixtures.sdk, 'clock', side_effect=clock):
+                result = self.f.engine.execute(self.f.root, permit, self.f.intent, host_operation=operation)
+        self.assertFalse(self.f.docker.writes)
+        self.assertEqual(result['execution'], 'not-performed')
+        self.assertEqual(result['status'], 'failed')
 
     def test_no_operation_cannot_authorize_or_send(self):
         with self.assertRaisesRegex(fixtures.backend.ExecutionError, 'host-operation-required'):

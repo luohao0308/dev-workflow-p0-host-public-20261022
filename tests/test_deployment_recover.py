@@ -50,12 +50,12 @@ class RecoveryStartIdentityTests(unittest.TestCase):
         docker = fixtures.MutableDocker()
         previous = deepcopy(docker.containers[fixtures.OLD])
         previous['State'].update(Running=False, Status='created')
-        previous['HostConfig']['OomKillDisable'] = None
+        previous['HostConfig']['OomKillDisable'] = False
         for key in recover.runtime.MANAGED_FILES.values():
             previous[key] = ''
         current = deepcopy(previous)
         current['State'].update(Running=True, Status='running')
-        current['HostConfig']['OomKillDisable'] = False
+        current['HostConfig']['OomKillDisable'] = None
         for filename, key in recover.runtime.MANAGED_FILES.items():
             current[key] = '/var/lib/docker/containers/' + fixtures.OLD + '/' + filename
         fields = ('Id', 'Name', 'Image', 'Config', 'HostConfig', *recover.runtime.MANAGED_FILES.values())
