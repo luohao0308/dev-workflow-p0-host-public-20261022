@@ -419,12 +419,13 @@ class TrustedDockerCollector:
                 raise RuntimeCollectionError('Observed image does not match trusted catalog')
             if (not isinstance(host, dict) or host.get('Privileged') is not False
                     or host.get('Devices') not in (None, []) or host.get('DeviceRequests') not in (None, [])
+                    or host.get('DeviceCgroupRules') not in (None, [])
                     or not isinstance(host.get('CapAdd'), (list, type(None)))
                     or any(not isinstance(cap, str) or cap.upper().removeprefix('CAP_') in ('SYS_ADMIN', 'ALL')
                            for cap in (host.get('CapAdd') or []))
                     or any(not isinstance(host.get(field), str)
                            or host[field] == 'host' or host[field].startswith('container:')
-                           for field in ('PidMode', 'IpcMode', 'NetworkMode'))):
+                           for field in ('PidMode', 'IpcMode', 'NetworkMode', 'UTSMode'))):
                 incomplete.append('unsupported-isolation:' + name)
             managed = {}
             for filename, field in MANAGED_FILES.items():

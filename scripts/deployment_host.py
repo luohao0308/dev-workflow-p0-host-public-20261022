@@ -14,6 +14,7 @@ import re
 import sys
 import time
 
+sys.dont_write_bytecode = True
 DISTRIBUTION = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(DISTRIBUTION / 'packs/deployment/scripts'))
 sys.path.insert(1, str(DISTRIBUTION / 'packs/release/scripts'))

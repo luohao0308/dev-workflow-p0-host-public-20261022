@@ -76,7 +76,8 @@ class DockerFixture:
                           'HostConfig': {'ReadonlyRootfs': True, 'Binds': None,
                                          'VolumesFrom': None, 'Tmpfs': None, 'Privileged': False,
                                          'Devices': [], 'DeviceRequests': None, 'CapAdd': None,
-                                         'PidMode': '', 'IpcMode': 'private', 'NetworkMode': 'fixture_default'}, 'Mounts': [],
+                                         'PidMode': '', 'IpcMode': 'private', 'NetworkMode': 'fixture_default',
+                                         'UTSMode': '', 'DeviceCgroupRules': None}, 'Mounts': [],
                           'State': {'Running': True, 'Paused': False, 'Restarting': False,
                                     'Dead': False, 'Status': 'running', 'Pid': 123,
                                     'StartedAt': '2026-01-01T00:00:00.000000000Z'}}
@@ -164,13 +165,19 @@ class RuntimeTests(unittest.TestCase):
                         {'DeviceRequests': [{'Count': -1}]}, {'CapAdd': ['SYS_ADMIN']},
                         {'CapAdd': ['CAP_SYS_ADMIN']}, {'CapAdd': ['ALL']},
                         {'PidMode': 'host'}, {'IpcMode': 'host'}, {'NetworkMode': 'host'},
-                        {'NetworkMode': 'container:external'}, {'Privileged': None}):
+                        {'NetworkMode': 'container:external'}, {'Privileged': None},
+                        {'DeviceCgroupRules': ['b *:* rwm']}, {'UTSMode': 'host'},
+                        {'UTSMode': 'container:external'}):
             c, fixture = collector()
             fixture.container['HostConfig'].update(changes)
             with self.subTest(changes=changes):
                 observation = c.collect()
                 self.assertFalse(observation.to_dict()['complete'])
                 self.assertNotIn(SECRET, observation.payload_json)
+                with self.assertRaises(runtime.RuntimeCollectionError):
+                    observation.snapshot()
+                with self.assertRaises(runtime.RuntimeCollectionError):
+                    c.validate(observation)
 
     def test_live_network_connect_drift_rejects_recheck(self):
         c, fixture = collector()

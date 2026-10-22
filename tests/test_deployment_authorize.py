@@ -207,7 +207,7 @@ class DeploymentAuthorizeTests(unittest.TestCase):
                         'module = importlib.util.module_from_spec(spec); sys.modules[spec.name] = module; '
                         'spec.loader.exec_module(module); import workflow_config; print(workflow_config.__file__)')
                 with self.subTest(script=script):
-                    result = subprocess.run([sys.executable, '-I', '-c', code, str(script), str(candidate)],
+                    result = subprocess.run([sys.executable, '-I', '-B', '-c', code, str(script), str(candidate)],
                                             capture_output=True, text=True)
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(Path(result.stdout.strip()).resolve(), (core / 'workflow_config.py').resolve())
