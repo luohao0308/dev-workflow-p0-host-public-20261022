@@ -236,6 +236,13 @@ def exercise(state):
                         and actual.get('State', {}).get('Running')):
                     # Keys only: never export raw configuration or private Env.
                     provision.save(output / 'start-transition-diagnostics.json', dict(
+                        previousStatus=previous.get('State', {}).get('Status'),
+                        oomBefore=previous.get('HostConfig', {}).get('OomKillDisable'),
+                        oomAfter=actual.get('HostConfig', {}).get('OomKillDisable'),
+                        managed=[dict(name=name, beforeEmpty=previous.get(key) in ('', None),
+                            afterMatchesId=type(actual.get(key)) is str and actual[key].endswith('/' + cid + '/' + name),
+                            unchanged=previous.get(key)==actual.get(key))
+                            for name,key in runtime.MANAGED_FILES.items()],
                         changedFields=sorted(k for k in set(previous) | set(actual)
                             if previous.get(k) != actual.get(k)),
                         changedConfigFields=sorted(k for k in set(previous.get('Config', {})) | set(actual.get('Config', {}))
