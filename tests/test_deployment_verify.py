@@ -265,6 +265,20 @@ class VerifierTests(unittest.TestCase):
             self.run_check(verifier)
         self.assertEqual(self.calls, [])
 
+    def test_post_read_authority_guard_does_not_spend_network_timeout(self):
+        profile = deepcopy(self.profile)
+        for phase in ('health', 'smoke'):
+            profile[phase][0]['timeout'] = .05
+        count = 0
+        def guard():
+            nonlocal count
+            count += 1
+            if count % 2 == 0:
+                time.sleep(.07)
+        result = self.run_check(self.verifier(profile), guard=guard)
+        self.assertTrue(result['passed'])
+        self.assertEqual(count, 4)
+
     def test_deadlines_before_after_guard_after_read_and_retry(self):
         with self.assertRaisesRegex(verify.VerificationError, 'probe-deadline-exceeded'):
             self.run_check(deadline=time.monotonic() - 1)
@@ -383,7 +397,7 @@ class VerifierTests(unittest.TestCase):
                 mock.patch.object(runtime, 'deadline_watchdog'):
             verifier = verify.TrustedProbeVerifier(probe_policy(self.runtime, [profile]), self.runtime,
                                                   ca_file=Path('/trusted/explicit-ca.pem'))
-            context.load_verify_locations.assert_called_once_with(cafile='/trusted/explicit-ca.pem')
+            context.load_verify_locations.assert_called_once_with(cafile=str(Path('/trusted/explicit-ca.pem')))
             context.load_verify_locations.reset_mock()
             self.assertTrue(self.run_check(verifier)['passed'])
             context.load_verify_locations.assert_not_called()

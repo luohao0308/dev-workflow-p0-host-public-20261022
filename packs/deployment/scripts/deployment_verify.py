@@ -452,8 +452,9 @@ class TrustedProbeVerifier:
                         code = str(error)
                     except (OSError, http.client.HTTPException):
                         code = 'probe-network-failed'
+                    read_completed = time.monotonic()
                     TrustedProbeVerifier._guard(guard, deadline)
-                    if time.monotonic() >= attempt_deadline:
+                    if read_completed >= attempt_deadline:
                         code = 'probe-deadline-exceeded'
                     if code is None:
                         try:
@@ -476,8 +477,6 @@ class TrustedProbeVerifier:
                             code = 'probe-response-rejected'
                     if time.monotonic() >= deadline:
                         raise VerificationError('probe-deadline-exceeded')
-                    if time.monotonic() >= attempt_deadline:
-                        code = 'probe-deadline-exceeded'
                     check['errorCode'] = code
                     if code is None:
                         check['status'] = 'passed'

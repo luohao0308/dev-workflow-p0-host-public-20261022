@@ -288,11 +288,14 @@ class DockerExecutor:
             raise ExecutionError('executor-policy-mismatch')
         self.policy, self.client, self.collector = policy, client, collector
         self.verifier = verifier
+        self._verification_adapter = verifier
         self._policy_hash = policy.identity_hash()
         self._issued, self._lock = {}, threading.Lock()
         self._verification_configuration()
 
     def _verification_configuration(self):
+        if self.verifier is not self._verification_adapter:
+            raise ExecutionError('verification-adapter-changed')
         if self.policy.verification_policy_hash is None:
             if self.verifier is not None:
                 raise ExecutionError('unexpected-verification-adapter')

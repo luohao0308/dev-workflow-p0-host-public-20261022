@@ -40,7 +40,7 @@ class DeploymentVerificationTests(unittest.TestCase):
         with mock.patch.object(execution, 'MutableDocker', PublishedDocker):
             self.base.setUp()
         self.addCleanup(self.base.doCleanups)
-        self.calls, self.fail = [], None
+        self.calls, self.probe_failure = [], None
         self.original_api = deepcopy(self.base.docker.containers[execution.API])
         profiles = []
         for digit, version in (('a', 'v1'), ('b', 'v2')):
@@ -65,13 +65,13 @@ class DeploymentVerificationTests(unittest.TestCase):
 
     def http(self, profile, probe, deadline):
         self.calls.append(probe['id'])
-        if self.fail == 'drift':
+        if self.probe_failure == 'drift':
             self.base.docker.managed_files[(execution.API, 'hosts')] = b'changed during HTTP'
         version = 'v1' if profile['imageId'].endswith('a' * 64) else 'v2'
         body = dict(ready=True, value=42, version=version)
-        if self.fail == 'business' and probe['id'] == 'business':
+        if self.probe_failure == 'business' and probe['id'] == 'business':
             body['value'] = 0
-        status = 503 if self.fail == 'health' else 200
+        status = 503 if self.probe_failure == 'health' else 200
         return status, [('Content-Type', 'application/json')], json.dumps(body).encode()
 
     def test_healthy_deploy_and_separately_authorized_rollback(self):
@@ -88,7 +88,7 @@ class DeploymentVerificationTests(unittest.TestCase):
         self.assertEqual(self.original_api, self.base.docker.containers[execution.API])
 
     def test_failed_health_stops_smoke_without_automatic_rollback(self):
-        self.fail = 'health'
+        self.probe_failure = 'health'
         result = self.base.execute()
         self.assertEqual(result['status'], 'executed-unhealthy')
         self.assertEqual(result['verification']['health'], 'failed')
@@ -100,20 +100,20 @@ class DeploymentVerificationTests(unittest.TestCase):
 
     def test_business_failure_returns_live_baseline_for_fresh_rollback(self):
         old = self.base.observation
-        self.fail = 'business'
+        self.probe_failure = 'business'
         result = self.base.execute()
         self.assertEqual(result['status'], 'executed-unhealthy')
         self.assertEqual(result['verification']['health'], 'passed')
         self.assertEqual(result['verification']['smoke'], 'failed')
         self.assertEqual(len(self.base.docker.writes), 4)
-        self.fail = None
+        self.probe_failure = None
         self.base.observation = result['observation']
         self.base.prepare('a', operation='deployment-rollback', rollback_target=old)
         self.assertEqual(self.base.execute()['status'], 'executed-verified')
         self.assertEqual(len(self.base.docker.writes), 8)
 
     def test_runtime_drift_during_http_is_not_reported_as_unhealthy(self):
-        self.fail = 'drift'
+        self.probe_failure = 'drift'
         result = self.base.execute()
         self.assertEqual(result['status'], 'executed-unverified')
         self.assertTrue(result['reconcileRequired'])
@@ -121,7 +121,7 @@ class DeploymentVerificationTests(unittest.TestCase):
         self.assertEqual(len(self.base.docker.writes), 4)
 
     def test_shadowed_verifier_method_cannot_bypass_required_checks(self):
-        self.fail = 'business'
+        self.probe_failure = 'business'
         self.verifier.check = lambda *a, **k: dict(passed=True, health='passed', smoke='passed', checks=[])
         result = self.base.execute()
         self.assertEqual(result['status'], 'executed-unhealthy')
@@ -133,6 +133,13 @@ class DeploymentVerificationTests(unittest.TestCase):
         profile['health'], profile['smoke'] = [], []
         self.verifier._profiles[key] = json.dumps(profile)
         with self.assertRaises(verify.VerificationError):
+            self.base.authorize()
+        self.assertFalse(self.base.docker.writes)
+
+    def test_equivalent_policy_does_not_allow_replacing_verifier_instance(self):
+        self.base.engine.verifier = verify.TrustedProbeVerifier(self.verifier.policy,
+            self.base.collector.policy, transport=lambda *a: (200, [], b'{"ready":true}'))
+        with self.assertRaisesRegex(execution.backend.ExecutionError, 'adapter-changed'):
             self.base.authorize()
         self.assertFalse(self.base.docker.writes)
 
