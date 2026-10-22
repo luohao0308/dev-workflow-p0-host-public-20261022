@@ -427,15 +427,31 @@ else:
             return result
         thread = threading.Thread(target=attacker)
         thread.start()
+        rejected = False
         try:
             with mock.patch.object(self.gate, boundary, side_effect=pause):
-                with self.assertRaises(gateway.GateError):
+                try:
                     action()
+                except gateway.GateError:
+                    rejected = True
         finally:
             reached.set()
             thread.join(6)
         self.assertFalse(thread.is_alive())
-        self.assertEqual(errors, [])
+        self.assertTrue(triggered, 'replacement boundary was never exercised')
+        if errors:
+            # Windows denies rename/unlink of these open handles. Prove the
+            # attack was prevented and the original signed store is still live;
+            # a permitted original write is then the correct outcome.
+            self.assertEqual(os.name, 'nt', errors)
+            self.assertTrue(all(isinstance(error, PermissionError) for error in errors), errors)
+            self.assertFalse(rejected, errors)
+            self.gate._live()
+            self.assertEqual(len(self.gate._attempts), 1)
+            self.gate.validate_proof(self.gate.close_generation(GEN))
+            return False
+        self.assertTrue(rejected, 'successful replacement did not block capability issuance')
+        return True
 
     def test_root_replaced_during_reserved_write_cannot_emit_attempt(self):
         session = self.open()
@@ -443,8 +459,9 @@ else:
         def replace_root():
             self.root.rename(old)
             shutil.copytree(old, self.root)
-        self.synchronized_replacement(
-            lambda: session.prepare_attempt('POST', CREATE, BODY), replace_root)
+        if not self.synchronized_replacement(
+                lambda: session.prepare_attempt('POST', CREATE, BODY), replace_root):
+            return
         self.assertEqual(self.gate._attempts, {})
         self.assertEqual((self.root / GEN / '00000001.json').read_bytes(), b'')
         with self.assertRaises(gateway.GateError):
@@ -457,8 +474,9 @@ else:
         def replace_generation():
             directory.rename(old)
             shutil.copytree(old, directory)
-        self.synchronized_replacement(
-            lambda: session.prepare_attempt('POST', CREATE, BODY), replace_generation)
+        if not self.synchronized_replacement(
+                lambda: session.prepare_attempt('POST', CREATE, BODY), replace_generation):
+            return
         self.assertEqual(self.gate._attempts, {})
         self.assertEqual((directory / '00000001.json').read_bytes(), b'')
         with self.assertRaises(gateway.GateError):
@@ -475,8 +493,9 @@ else:
             record.write_bytes(b'foreign blocker')
             if os.name != 'nt':
                 record.chmod(0o600)
-        self.synchronized_replacement(
-            lambda: session.prepare_attempt('POST', CREATE, BODY), replace_reservation)
+        if not self.synchronized_replacement(
+                lambda: session.prepare_attempt('POST', CREATE, BODY), replace_reservation):
+            return
         self.assertEqual(record.read_bytes(), b'foreign blocker')
         with self.assertRaises(gateway.GateError):
             self.gate.close_generation(GEN)
@@ -570,8 +589,9 @@ else:
             parent.rename(moved)
             parent.mkdir(mode=0o700)
             (moved / 'gate').rename(self.root)
-        self.synchronized_replacement(
-            lambda: session.prepare_attempt('POST', CREATE, BODY), replace_ancestor)
+        if not self.synchronized_replacement(
+                lambda: session.prepare_attempt('POST', CREATE, BODY), replace_ancestor):
+            return
         self.assertEqual(self.gate._identity(self.root), identity)
         with self.assertRaises(gateway.GateError):
             self.gate.info()
