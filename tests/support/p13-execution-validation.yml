@@ -15,7 +15,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: p13-isolated-validation
+  group: p13-isolated-validation-${{ inputs.real_authority }}
   cancel-in-progress: false
 jobs:
   observer:
@@ -42,7 +42,7 @@ jobs:
           import subprocess,sys,time
           from pathlib import Path
           log=open('p13-observer.log','wb')
-          subprocess.Popen([sys.executable,'-I','tests/support/p1_execution_live.py'],stdout=log,stderr=log,start_new_session=True)
+          subprocess.Popen([sys.executable,'-I','-B','tests/support/p1_execution_live.py'],stdout=log,stderr=log,start_new_session=True)
           for _ in range(90):
               if Path('p13-results/failure.json').exists():
                   raise SystemExit(Path('p13-results/failure.json').read_text())
