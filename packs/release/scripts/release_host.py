@@ -182,10 +182,26 @@ class GitHubActionsApproval:
     An alternate verifier is solely a trusted embedding/test dependency, never a
     project-selected module or CLI option. GitHub-hosted Linux is the first host.
     """
+    # Only trusted distribution subclasses may specialize these hooks. There is
+    # deliberately no module path, plugin loader, or candidate configuration hook.
+    request_type = Request
+    operations = OPERATIONS
+    audience = AUDIENCE
+    grant_type = Grant
+    receipt_type = Receipt
+    ledger_namespace = 'workflow-grants'
+    grant_namespace = 'github-actions'
+
+    def _approval_environment(self):
+        return self.policy.environment
+
+    def _grant_expiry(self, request):
+        return self._expires
+
     def __init__(self, client, oidc_token, requests, policy: HostPolicy, *, verifier=None):
         self.client, self.token, self.policy = client, oidc_token, policy
         self.requests = tuple(requests)
-        if (not self.requests or any(not isinstance(item, Request) or item.operation not in OPERATIONS for item in self.requests)
+        if (not self.requests or any(type(item) is not self.request_type or item.operation not in self.operations for item in self.requests)
                 or len({item.operation for item in self.requests}) != len(self.requests)):
             _deny('Invalid frozen operation bundle')
         self._requests = {item.digest(): item for item in self.requests}
@@ -216,7 +232,7 @@ class GitHubActionsApproval:
                 or claims['exp'] <= now or claims['nbf'] > now or claims['iat'] > now
                 or claims['iat'] < now - 600 or claims['exp'] - claims['iat'] > 600):
             _deny('OIDC token expired or outside bounded lifetime')
-        expected = {'iss': ISSUER, 'aud': AUDIENCE, 'repository': policy.host_repository,
+        expected = {'iss': ISSUER, 'aud': self.audience, 'repository': policy.host_repository,
                     'repository_id': str(policy.host_repository_id), 'workflow_ref': policy.workflow_ref,
                     'workflow_sha': policy.workflow_sha, 'run_id': str(policy.run_id), 'run_attempt': '1',
                     'environment': policy.environment}
@@ -240,9 +256,10 @@ class GitHubActionsApproval:
                 or run.get('repository', {}).get('id') != policy.host_repository_id
                 or str(run.get('actor', {}).get('id')) != claims.get('actor_id')):
             _deny('Workflow run does not match authenticated execution')
-        environment = self._get('/repos/' + policy.host_repository + '/environments/' + policy.environment)
+        approval_environment = self._approval_environment()
+        environment = self._get('/repos/' + policy.host_repository + '/environments/' + approval_environment)
         if (type(environment.get('id')) is not int or environment['id'] <= 0
-                or environment.get('name') != policy.environment):
+                or environment.get('name') != approval_environment):
             _deny('Protected environment identity changed')
         rules = environment.get('protection_rules', [])
         required = [rule for rule in rules if rule.get('type') == 'required_reviewers']
@@ -261,7 +278,7 @@ class GitHubActionsApproval:
                     and review.get('user', {}).get('id') in policy.reviewer_ids
                     and (not policy.prevent_self_review or review.get('user', {}).get('id') != run.get('actor', {}).get('id'))
                     and review.get('comment') == 'dev-workflow approve ' + self.bundle_hash
-                    and any(item.get('id') == environment.get('id') and item.get('name') == policy.environment
+                    and any(item.get('id') == environment.get('id') and item.get('name') == approval_environment
                             for item in review.get('environments', []))]
         if not approved:
             _deny('Exact operation bundle lacks protected-environment approval')
@@ -294,7 +311,7 @@ class GitHubActionsApproval:
             _deny('OIDC workflow identity does not match trusted policy', mismatch_fields=('sub',))
 
     def _match(self, request):
-        if not isinstance(request, Request) or self._requests.get(request.digest()) != request:
+        if type(request) is not self.request_type or self._requests.get(request.digest()) != request:
             _deny('Operation differs from reviewed bundle')
         if request.release_json:
             try:
@@ -314,15 +331,15 @@ class GitHubActionsApproval:
     def validate(self, request):
         self._match(request)
         self._check_authority()
-        expires = datetime.fromtimestamp(self._expires, timezone.utc).isoformat()
-        return Grant('github-actions:' + str(self.policy.run_id) + ':' + request.operation, request.digest(), expires, 1)
+        expires = datetime.fromtimestamp(self._grant_expiry(request), timezone.utc).isoformat()
+        return self.grant_type(self.grant_namespace + ':' + str(self.policy.run_id) + ':' + request.operation, request.digest(), expires, 1)
 
     def consume(self, grant, request):
         with self._lock:
             expected = self.validate(request)
-            if grant != expected or request.digest() in self._consumed:
+            if type(grant) is not self.grant_type or grant != expected or request.digest() in self._consumed:
                 _deny('Grant changed or already consumed')
-            marker = 'refs/tags/workflow-grants/' + str(self.policy.run_id) + '/' + self.bundle_hash + '/' + request.operation
+            marker = 'refs/tags/' + self.ledger_namespace + '/' + str(self.policy.run_id) + '/' + self.bundle_hash + '/' + request.operation
             # No automatic retry: both a duplicate and a lost response deny dispatch.
             self._consumed.add(request.digest())
             try:
@@ -333,7 +350,7 @@ class GitHubActionsApproval:
             if not isinstance(value, dict) or value.get('ref') != marker or value.get('object', {}).get('sha') != self.policy.ledger_sha:
                 _deny('Durable grant consumption not verified')
             self._verified_consumptions.add(request.digest())
-            return Receipt(grant.grant_id, request.digest(), 1, datetime.now(timezone.utc).isoformat())
+            return self.receipt_type(grant.grant_id, request.digest(), 1, datetime.now(timezone.utc).isoformat())
 
     def guard(self, request):
         """Provider calls immediately before dispatch; never issues another grant."""
@@ -341,9 +358,9 @@ class GitHubActionsApproval:
         self._check_authority()
         if request.digest() not in self._verified_consumptions:
             _deny('Mutation requires consumed grant')
-        marker = 'tags/workflow-grants/' + str(self.policy.run_id) + '/' + self.bundle_hash + '/' + request.operation
+        marker = 'tags/' + self.ledger_namespace + '/' + str(self.policy.run_id) + '/' + self.bundle_hash + '/' + request.operation
         value = self._get('/repos/' + self.policy.ledger_repository + '/git/ref/' + marker)
         if value.get('ref') != 'refs/' + marker or value.get('object', {}).get('sha') != self.policy.ledger_sha:
             _deny('Durable grant ledger changed')
-        if time.time() >= self._expires:
+        if time.time() >= self._grant_expiry(request):
             _deny('Authorization expired during ledger verification')

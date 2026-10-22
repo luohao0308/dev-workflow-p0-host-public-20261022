@@ -110,6 +110,42 @@ class ReleaseHostTests(unittest.TestCase):
             approval.consume(grant, self.req)
         self.assertEqual(self.client.posts, 1)
 
+    def test_release_host_defaults_remain_bound(self):
+        approval = self.make_host()
+        self.assertIs(approval.request_type, Request)
+        self.assertEqual(approval.operations, host.OPERATIONS)
+        self.assertEqual(approval.audience, 'dev-workflow-release-host')
+        self.assertEqual(approval.ledger_namespace, 'workflow-grants')
+        self.assertEqual(approval._approval_environment(), self.policy.environment)
+        grant = approval.validate(self.req)
+        self.assertIs(type(grant), host.Grant)
+        self.assertEqual(grant.grant_id, 'github-actions:123:remote-tag-push')
+        receipt = approval.consume(grant, self.req)
+        self.assertIs(type(receipt), host.Receipt)
+        self.assertTrue(next(iter(self.client.markers)).startswith('tags/workflow-grants/123/'))
+
+    def test_request_subclasses_cannot_replace_frozen_domain(self):
+        class OtherRequest(Request):
+            pass
+        other = OtherRequest(**vars(self.req))
+        with self.assertRaises(AuthorizationUnavailable):
+            host.GitHubActionsApproval(self.client, 'token', [other], self.policy,
+                                      verifier=lambda token: self.claims)
+        with self.assertRaises(AuthorizationUnavailable):
+            self.make_host().validate(other)
+
+    def test_wrong_grant_types_cannot_consume_even_with_matching_equality(self):
+        class OtherGrant(host.Grant):
+            def __eq__(self, other):
+                return True
+        approval = self.make_host()
+        expected = approval.validate(self.req)
+        for grant in (OtherGrant(**vars(expected)),
+                      host.Receipt(expected.grant_id, expected.request_hash, 1, expected.expires_at)):
+            with self.subTest(kind=type(grant)), self.assertRaises(AuthorizationUnavailable):
+                approval.consume(grant, self.req)
+        self.assertEqual(self.client.posts, 0)
+
     def test_bundle_binds_order_and_expiry(self):
         second = request('local-tag-create')
         self.assertNotEqual(host.bundle_digest([self.req, second], self.policy.expires_at),

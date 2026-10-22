@@ -1,0 +1,11 @@
+{
+  "hostRepository": "luohao0308/dev-workflow-p0-host-public-20261022",
+  "hostRepositoryId": 1428943173,
+  "targetRepository": "luohao0308/dev-workflow-p0-target-20261022",
+  "targetRepositoryId": 1428943581,
+  "reviewerIds": [
+    84822776
+  ],
+  "oldSha": "fc006bc3d2bc968aec73ee7059e596c01b778a2a",
+  "newSha": "4efeab8b9c11c3f4ff366cd4c893b470d19bba12"
+}
