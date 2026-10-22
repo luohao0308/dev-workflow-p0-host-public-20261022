@@ -156,7 +156,7 @@ class TestApproval:
             raise ValueError('Fixture grant not spent')
 
 
-def main():
+def main(*, exercise=None):
     if sys.platform != 'linux' or os.environ.get('GITHUB_ACTIONS') != 'true':
         raise SystemExit('Independent Linux Actions fixture only')
     smoke = os.environ.get('P14_MODE') == 'smoke'
@@ -240,6 +240,11 @@ def main():
         old = collector.collect()
         save(output / 'initial-observation.json', old.to_dict())
         assert old.to_dict()['complete'] is True, old.to_dict()['incomplete']
+        if exercise is not None:
+            # A trusted sibling fixture may reuse provisioning, never candidate code.
+            return exercise(dict(directory=directory, output=output, metadata=metadata, candidate=candidate,
+                project=project, images=images, catalog=catalog, policy=policy, collector=collector,
+                executor=executor, server=server, certificate_hash=cert_hash))
         # Independent server-side restrictions, not just client method guards.
         readonly_policy = replace(epolicy, writer_certificate_sha256=cert_hash('reader'))
         readonly_writer = execution.DockerMutationClient(readonly_policy, ca_file=directory / 'ca.pem',

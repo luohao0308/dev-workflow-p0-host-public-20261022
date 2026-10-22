@@ -56,6 +56,8 @@ class ExecutionPolicy:
     stop_timeout: int = 10
     execution_deadline: int = 180
     verification_policy_hash: str | None = None
+    history_policy_hash: str | None = None
+    gateway_policy_hash: str | None = None
 
     def __post_init__(self):
         if (type(self.runtime_policy) is not runtime.RuntimePolicy
@@ -71,12 +73,19 @@ class ExecutionPolicy:
                      or not runtime.HEX.fullmatch(self.verification_policy_hash))):
             raise ExecutionError('invalid-verification-policy')
 
+        if ((self.history_policy_hash is None) != (self.gateway_policy_hash is None)
+                or any(value is not None and (type(value) is not str or not runtime.HEX.fullmatch(value))
+                       for value in (self.history_policy_hash, self.gateway_policy_hash))):
+            raise ExecutionError('invalid-host-recovery-policy')
+
     def identity_hash(self):
         value = dict(profile=PROFILE, runtimePolicyHash=self.runtime_policy.identity_hash(),
                      writerCertificateSha256=self.writer_certificate_sha256,
                      stopTimeout=self.stop_timeout, executionDeadline=self.execution_deadline)
         if self.verification_policy_hash is not None:
             value['verificationPolicyHash'] = self.verification_policy_hash
+        if self.history_policy_hash is not None:
+            value.update(hostStorePolicyHash=self.history_policy_hash, writerGatePolicyHash=self.gateway_policy_hash)
         return digest(value)
 
 
@@ -110,17 +119,22 @@ class DockerMutationClient:
             except Exception:
                 raise ExecutionError('writer-credentials-rejected') from None
 
-    def create(self, name, body, *, before_send):
+    def create(self, name, body, *, before_send, host_operation=None):
         try:
             frozen = canonical(body)
-            if (not isinstance(name, str) or not re.fullmatch(r'dwf-[0-9a-f]{64}', name)
+            if (not isinstance(name, str) or not re.fullmatch(r'(?:dwf-|dev-workflow-recover-)[0-9a-f]{64}', name)
                     or len(frozen.encode('ascii')) > MAX_BODY or not isinstance(body, dict)):
                 raise ValueError
             execution_id = body['Labels'][EXECUTION_LABEL]
             if not isinstance(execution_id, str) or not runtime.HEX.fullmatch(execution_id):
                 raise ValueError
             if name != 'dwf-' + execution_id:
-                raise ValueError
+                from deployment_recover import HostOperation
+                if (name != 'dev-workflow-recover-' + execution_id
+                        or type(host_operation) is not HostOperation
+                        or host_operation._coordinator._recovery_writer is not host_operation):
+                    raise ValueError
+                HostOperation.validate_writer(host_operation, self.policy)
             specs = _specifications(self.policy.runtime_policy)
             if not any(canonical(spec.to_create(self.policy.runtime_policy.project, execution_id)) == frozen
                        for spec in specs.values()):
@@ -128,30 +142,30 @@ class DockerMutationClient:
         except Exception:
             raise ExecutionError('create-payload-rejected') from None
         return self._write('POST', '/v1.45/containers/create?' + urlencode({'name': name}),
-                           json.loads(frozen), before_send, 201)
+                           json.loads(frozen), before_send, 201, host_operation=host_operation)
 
-    def _container(self, action, container_id, before_send):
+    def _container(self, action, container_id, before_send, host_operation=None):
         if not isinstance(container_id, str) or not runtime.CONTAINER.fullmatch(container_id):
             raise ExecutionError('container-id-rejected')
         method, suffix = {'stop': ('POST', '/stop?t=' + str(self.policy.stop_timeout)),
                           'remove': ('DELETE', '?force=false&v=false'),
                           'start': ('POST', '/start')}[action]
         return self._write(method, '/v1.45/containers/' + container_id + suffix,
-                           None, before_send, 204)
+                           None, before_send, 204, host_operation=host_operation)
 
-    def stop(self, container_id, *, before_send):
-        return self._container('stop', container_id, before_send)
+    def stop(self, container_id, *, before_send, host_operation=None):
+        return self._container('stop', container_id, before_send, host_operation)
 
-    def remove(self, container_id, *, before_send):
-        return self._container('remove', container_id, before_send)
+    def remove(self, container_id, *, before_send, host_operation=None):
+        return self._container('remove', container_id, before_send, host_operation)
 
-    def start(self, container_id, *, before_send):
-        return self._container('start', container_id, before_send)
+    def start(self, container_id, *, before_send, host_operation=None):
+        return self._container('start', container_id, before_send, host_operation)
 
-    def _write(self, method, path, body, before_send, expected):
+    def _write(self, method, path, body, before_send, expected, *, host_operation=None):
         if (not callable(before_send) or not (
                 (method == 'POST' and expected == 201 and body is not None
-                 and re.fullmatch(r'/v1\.45/containers/create\?name=dwf-[0-9a-f]{64}', path))
+                 and re.fullmatch(r'/v1\.45/containers/create\?name=(?:dwf-|dev-workflow-recover-)[0-9a-f]{64}', path))
                 or (method == 'POST' and expected == 204 and body is None
                     and re.fullmatch(r'/v1\.45/containers/[0-9a-f]{64}/(?:start|stop\?t=' + str(self.policy.stop_timeout) + ')', path))
                 or (method == 'DELETE' and expected == 204 and body is None
@@ -177,6 +191,21 @@ class DockerMutationClient:
                 certificate = connection.sock.getpeercert(binary_form=True)
                 if hashlib.sha256(certificate).hexdigest() != self.policy.runtime_policy.server_certificate_sha256:
                     raise ExecutionError('writer-peer-pin-rejected')
+            session = attempt = None
+            if self.policy.gateway_policy_hash is not None:
+                from deployment_recover import HostOperation
+                if type(host_operation) is not HostOperation:
+                    raise ExecutionError('host-operation-required')
+                HostOperation.validate_writer(host_operation, self.policy)
+                session = HostOperation.before_write(host_operation, method, path, wire_body or b'')
+                from deployment_gateway import WriterSession
+                if type(session) is not WriterSession:
+                    raise ExecutionError('writer-session-required')
+                attempt = WriterSession.prepare_attempt(session, method, path, wire_body or b'')
+                if session._gate.policy.identity_hash() != self.policy.gateway_policy_hash:
+                    raise ExecutionError('writer-gate-policy-mismatch')
+            elif host_operation is not None:
+                raise ExecutionError('unexpected-host-operation')
             phase = 'execution-guard-rejected'
             supplied_deadline = before_send()
             if type(supplied_deadline) in (int, float):
@@ -187,10 +216,14 @@ class DockerMutationClient:
                 timeout = min(timeout, remaining)
                 if connection is not None and connection.sock is not None:
                     connection.sock.settimeout(timeout)
+            headers = {'Content-Type': 'application/json', 'Accept': 'application/json'}
+            if session is not None:
+                headers.update(WriterSession.headers(session, attempt))
             phase = 'writer-response-unknown'
             attempted = True
             if self._transport is not None:
-                status, value = self._transport(method, path, body)
+                status, value = (self._transport(method, path, body) if session is None
+                                 else self._transport(method, path, body, headers))
                 raw = canonical(value).encode('ascii') if value is not None else b''
             else:
                 # Inactivity limits do not bound trickled status/header bytes.
@@ -203,7 +236,7 @@ class DockerMutationClient:
                 if time.monotonic() >= response_deadline:
                     raise ExecutionError('writer-response-unknown', may_have_mutated=True)
                 connection.request(method, path, body=wire_body,
-                                   headers={'Content-Type': 'application/json', 'Accept': 'application/json'})
+                                   headers=headers)
                 response = connection.getresponse()
                 status = response.status
                 # Bounded overall response read, including slow streaming peers.
@@ -229,9 +262,13 @@ class DockerMutationClient:
                         or not runtime.CONTAINER.fullmatch(value['Id'])
                         or value.get('Warnings') not in (None, [])):
                     raise ExecutionError('create-response-unverified', may_have_mutated=True)
+                if session is not None:
+                    HostOperation.after_write(host_operation, session, hashlib.sha256(str(status).encode() + b'\0' + bytes(raw)).hexdigest())
                 return value
             if raw:
                 raise ExecutionError('writer-response-unverified', may_have_mutated=True)
+            if session is not None:
+                HostOperation.after_write(host_operation, session, hashlib.sha256(str(status).encode() + b'\0' + bytes(raw)).hexdigest())
             return None
         except ExecutionError as error:
             if attempted and not error.may_have_mutated:
@@ -280,7 +317,7 @@ def _request_scope(request):
 
 
 class DockerExecutor:
-    def __init__(self, policy, client, collector, *, verifier=None):
+    def __init__(self, policy, client, collector, *, verifier=None, coordinator=None):
         if (type(policy) is not ExecutionPolicy or type(client) is not DockerMutationClient
                 or type(collector) is not runtime.TrustedDockerCollector
                 or client.policy != policy or collector.policy != policy.runtime_policy
@@ -289,9 +326,38 @@ class DockerExecutor:
         self.policy, self.client, self.collector = policy, client, collector
         self.verifier = verifier
         self._verification_adapter = verifier
+        self.coordinator = self._host_coordinator = coordinator
         self._policy_hash = policy.identity_hash()
         self._issued, self._lock = {}, threading.Lock()
         self._verification_configuration()
+        self._host_configuration()
+
+    def _host_configuration(self):
+        if self.coordinator is not self._host_coordinator:
+            raise ExecutionError('host-coordinator-changed')
+        if self.policy.gateway_policy_hash is None:
+            if self.coordinator is not None:
+                raise ExecutionError('unexpected-host-coordinator')
+            return
+        from deployment_recover import HostCoordinator
+        if (type(self.coordinator) is not HostCoordinator
+                or self.coordinator.execution_policy != self.policy
+                or self.coordinator.collector is not self.collector
+                or self.coordinator.store.policy.identity_hash() != self.policy.history_policy_hash
+                or self.coordinator.gate.policy.identity_hash() != self.policy.gateway_policy_hash):
+            raise ExecutionError('host-coordinator-required')
+        HostCoordinator._fixed(self.coordinator)
+
+    def _operation(self, root, intent, host_operation):
+        self._host_configuration()
+        if self.policy.gateway_policy_hash is None:
+            if host_operation is not None:
+                raise ExecutionError('unexpected-host-operation')
+            return
+        from deployment_recover import HostOperation
+        if type(host_operation) is not HostOperation or host_operation._coordinator is not self.coordinator:
+            raise ExecutionError('host-operation-required')
+        HostOperation.validate(host_operation, root, intent)
 
     def _verification_configuration(self):
         if self.verifier is not self._verification_adapter:
@@ -309,15 +375,22 @@ class DockerExecutor:
 
     def _fixed(self):
         self._verification_configuration()
+        self._host_configuration()
         if (self.policy.identity_hash() != self._policy_hash or self.client.policy != self.policy
                 or self.collector.policy != self.policy.runtime_policy
                 or self.collector.client.policy != self.policy.runtime_policy):
             raise ExecutionError('executor-policy-changed')
 
     def _request(self, root, plan, operation, observation, rollback_target, expires_at=None):
+        repository_id = 1
+        if rollback_target is not None and type(rollback_target) is not runtime.RuntimeObservation:
+            from deployment_store import HistoricalSnapshot
+            if type(rollback_target) is HistoricalSnapshot:
+                self.collector.validate_history(rollback_target, before=observation)
+                repository_id = rollback_target._store.policy.repository_id
         return sdk.build_request(root, plan, operation, collector=self.collector, observation=observation,
                                  rollback_target=rollback_target,
-                                 repository_slug=self.policy.runtime_policy.repository, repository_id=1,
+                                 repository_slug=self.policy.runtime_policy.repository, repository_id=repository_id,
                                  expires_at=expires_at or (sdk.clock() + timedelta(minutes=1)).isoformat())
 
     def _inventory(self, deadline):
@@ -422,6 +495,9 @@ class DockerExecutor:
                        specHash=spec.configuration_digest(), component=component, imageId=spec.image_id,
                        beforeContainerId=old_ids[0], resourceName='dwf-' + nonce,
                        actions=['create', 'stop', 'remove', 'start'])
+        if self.policy.history_policy_hash is not None:
+            binding.update(hostStorePolicyHash=self.policy.history_policy_hash,
+                           writerGatePolicyHash=self.policy.gateway_policy_hash)
         probe_binding = None
         if self.verifier is not None:
             from deployment_verify import TrustedProbeVerifier
@@ -523,7 +599,8 @@ class DockerExecutor:
         if time.monotonic() >= deadline:
             raise ExecutionError('execution-deadline-exceeded')
 
-    def execute(self, root, permit, intent):
+    def execute(self, root, permit, intent, *, host_operation=None):
+        self._operation(root, intent, host_operation)
         if type(permit) is not sdk.DeploymentPermit or type(intent) is not ExecutionIntent:
             raise ExecutionError('execution-capability-required')
         record = self._issued.get(id(intent))
@@ -549,7 +626,12 @@ class DockerExecutor:
                       authorizationConsumed=True, reconcileRequired=False, actions=[], lastAction=None,
                       verification=dict(runtime='unknown', deployment='unknown', rollback='unknown',
                                         health='unknown', smoke='unknown', backup='unknown'))
-        with LifecycleLock(root, 'deployment-execution'):
+        lifecycle = (LifecycleLock(root, 'deployment-execution') if host_operation is None
+                     else host_operation.lifecycle('deployment-execution'))
+        with lifecycle as core_lock:
+            if host_operation is not None:
+                from deployment_recover import HostOperation
+                HostOperation.record_owner(host_operation, core_lock)
             if pending_upgrades(root):
                 raise ExecutionError('unfinished-upgrade')
             sdk._assert_output(root, relative)
@@ -580,14 +662,14 @@ class DockerExecutor:
                         if action == 'create':
                             response = self.client.create(binding['resourceName'],
                                 record['spec'].to_create(self.policy.runtime_policy.project, binding['intentId']),
-                                before_send=before_send)
+                                before_send=before_send, **({} if host_operation is None else dict(host_operation=host_operation)))
                             new_id = response['Id']
                             result['containerId'] = new_id
                             if new_id in json.loads(record['baseline']):
                                 raise ExecutionError('create-returned-existing-id', may_have_mutated=True)
                         else:
                             getattr(self.client, action)(new_id if action == 'start' else binding['beforeContainerId'],
-                                                         before_send=before_send)
+                                                         before_send=before_send, **({} if host_operation is None else dict(host_operation=host_operation)))
                     except ExecutionError as error:
                         attempted = attempted or error.may_have_mutated
                         action_record['status'] = 'unknown' if error.may_have_mutated else 'not-sent'
@@ -631,6 +713,8 @@ class DockerExecutor:
                 sdk._audit(root, relative, result)
                 # Keep actual collector-issued proof for a fresh, separate rollback
                 # preparation. Audit/export above contains only its JSON evidence.
+                if host_operation is not None:
+                    HostOperation.finish(host_operation, dict(result, observation=observation))
                 return dict(result, observation=observation)
             except Exception as error:
                 unknown = isinstance(error, ExecutionError) and error.may_have_mutated
