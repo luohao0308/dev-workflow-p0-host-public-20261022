@@ -692,11 +692,18 @@ class LocalMutationTLSTests(unittest.TestCase):
 
     def test_trickled_headers_respect_total_budget_without_retry(self):
         self.header_drip = True
-        started = time.monotonic()
+        # Loading Windows trust roots can take seconds. The budget begins at
+        # the guarded send boundary, not during client/certificate setup.
+        client = self.client()
+        started = []
+        def send_budget():
+            started.append(time.monotonic())
+            return started[0] + 0.15
         with self.assertRaises(backend.ExecutionError) as caught:
-            self.client().start(OLD, before_send=lambda: time.monotonic() + 0.15)
+            client.start(OLD, before_send=send_budget)
         self.assertTrue(caught.exception.may_have_mutated)
-        self.assertLess(time.monotonic() - started, 2)
+        self.assertEqual(len(started), 1)
+        self.assertLess(time.monotonic() - started[0], 2)
         self.assertEqual(len(self.http_calls), 1)
 
 
