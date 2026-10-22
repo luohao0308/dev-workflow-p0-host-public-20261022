@@ -20,6 +20,7 @@ from pathlib import Path
 import re
 import secrets
 import ssl
+import socket
 import sys
 import tarfile
 import threading
@@ -57,6 +58,19 @@ def digest(value):
 
 def utcnow():
     return datetime.now(timezone.utc)
+
+
+def deadline_watchdog(peer, deadline):
+    """Bound status/header reads as well as body inactivity on one connection."""
+    def abort():
+        try:
+            peer.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+    timer = threading.Timer(max(0, deadline - time.monotonic()), abort)
+    timer.daemon = True
+    timer.start()
+    return timer
 
 
 def unique(pairs):
@@ -263,6 +277,7 @@ class DockerTLSClient:
         """Shared pinned mTLS request for internally allowlisted JSON/binary GETs."""
         connection = None
         response = None
+        watchdog = None
         try:
             remaining = self.timeout if deadline is None else min(self.timeout, deadline - time.monotonic())
             if remaining <= 0:
@@ -287,12 +302,13 @@ class DockerTLSClient:
                 if remaining <= 0:
                     raise RuntimeCollectionError('Runtime capture deadline exceeded')
                 peer.settimeout(min(self.timeout, remaining))
+            read_deadline = min(deadline if deadline is not None else float('inf'),
+                                time.monotonic() + self.timeout)
+            watchdog = deadline_watchdog(peer, read_deadline)
             connection.request('GET', path, headers={'Accept': 'application/x-tar' if binary else 'application/json'})
             response = connection.getresponse()
             if response.status != 200:
                 raise RuntimeCollectionError('Runtime read failed')
-            read_deadline = min(deadline if deadline is not None else float('inf'),
-                                time.monotonic() + self.timeout)
             raw = bytearray()
             while len(raw) <= MAX_RESPONSE:
                 remaining = read_deadline - time.monotonic()
@@ -311,6 +327,8 @@ class DockerTLSClient:
             # Neither Docker error bodies nor paths/credentials from exceptions escape.
             raise RuntimeCollectionError('Trusted Docker read failed') from None
         finally:
+            if watchdog is not None:
+                watchdog.cancel()
             if response is not None:
                 response.close()
             if connection is not None:

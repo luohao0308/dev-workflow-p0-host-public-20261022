@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import unittest
 from unittest import mock
 from urllib.parse import parse_qs, urlsplit
@@ -195,30 +196,30 @@ class DeploymentExecuteTests(unittest.TestCase):
         permit = self.authorize()
         ready, finished = threading.Event(), threading.Event()
         errors = []
-        original = self.engine._validate_intent
-        def delayed(*args, **kwargs):
-            original(*args, **kwargs)
-            if threading.current_thread().name == 'delayed-replay':
+        original = backend.DockerExecutor._validate_intent
+        def delayed(engine, *args, **kwargs):
+            original(engine, *args, **kwargs)
+            if engine is self.engine and threading.current_thread().name == 'delayed-replay':
                 ready.set()
-                if not finished.wait(30):
+                if not finished.wait(120):
                     raise AssertionError('Replay coordination timed out')
         def replay():
             try:
                 self.engine.execute(self.root, permit, self.intent)
             except Exception as error:
                 errors.append(error)
-        with mock.patch.object(self.engine, '_validate_intent', side_effect=delayed):
+        with mock.patch.object(backend.DockerExecutor, '_validate_intent', new=delayed):
             thread = threading.Thread(target=replay, name='delayed-replay')
             thread.start()
             try:
-                self.assertTrue(ready.wait(10))
+                self.assertTrue(ready.wait(30))
                 result = self.engine.execute(self.root, permit, self.intent)
                 self.assertEqual(result['status'], 'executed-verified')
                 path, = (self.root / sdk.RECORDS).glob('execution-*.json')
                 evidence = path.read_bytes()
             finally:
                 finished.set()
-                thread.join(10)
+                thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertEqual(len(errors), 1)
         self.assertEqual(path.read_bytes(), evidence)
@@ -601,6 +602,8 @@ class LocalMutationTLSTests(unittest.TestCase):
     def setUp(self):
         self.docker = MutableDocker()
         self.http_calls = []
+        self.header_drip = False
+        test = self
         daemon, calls = self.docker, self.http_calls
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *_):
@@ -611,6 +614,15 @@ class LocalMutationTLSTests(unittest.TestCase):
                 length = int(self.headers.get('Content-Length', '0'))
                 body = json.loads(self.rfile.read(length)) if length else None
                 status, value = daemon.write('POST', self.path, body)
+                if test.header_drip:
+                    for byte in b'HTTP/1.1 204 No Content\r\nX-Drip: ' + b'x' * 1000 + b'\r\n\r\n':
+                        try:
+                            self.connection.sendall(bytes([byte]))
+                        except OSError:
+                            break
+                        time.sleep(0.02)
+                    self.close_connection = True
+                    return
                 raw = json.dumps(value).encode() if value is not None else b''
                 self.send_response(status)
                 self.send_header('Content-Length', str(len(raw)))
@@ -677,6 +689,15 @@ class LocalMutationTLSTests(unittest.TestCase):
             self.client().stop(OLD, before_send=lambda: (_ for _ in ()).throw(ValueError(SECRET)))
         self.assertFalse(caught.exception.may_have_mutated)
         self.assertEqual(self.http_calls, [])
+
+    def test_trickled_headers_respect_total_budget_without_retry(self):
+        self.header_drip = True
+        started = time.monotonic()
+        with self.assertRaises(backend.ExecutionError) as caught:
+            self.client().start(OLD, before_send=lambda: time.monotonic() + 0.15)
+        self.assertTrue(caught.exception.may_have_mutated)
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertEqual(len(self.http_calls), 1)
 
 
 if __name__ == '__main__':

@@ -154,6 +154,7 @@ class DockerMutationClient:
         except Exception:
             raise ExecutionError('writer-payload-rejected') from None
         connection = response = None
+        watchdog = None
         timeout = max(self.timeout, self.policy.stop_timeout + 5) if '/stop?' in path else self.timeout
         timeout = min(timeout, self.policy.execution_deadline)
         absolute_deadline = None
@@ -184,13 +185,21 @@ class DockerMutationClient:
                 status, value = self._transport(method, path, body)
                 raw = canonical(value).encode('ascii') if value is not None else b''
             else:
+                # Inactivity limits do not bound trickled status/header bytes.
+                # Abort this connection at the total budget; the Docker write
+                # still has an uncertain outcome and is never retried.
+                peer = connection.sock
+                response_deadline = min(time.monotonic() + timeout,
+                    absolute_deadline if absolute_deadline is not None else float('inf'))
+                watchdog = runtime.deadline_watchdog(peer, response_deadline)
+                if time.monotonic() >= response_deadline:
+                    raise ExecutionError('writer-response-unknown', may_have_mutated=True)
                 connection.request(method, path, body=wire_body,
                                    headers={'Content-Type': 'application/json', 'Accept': 'application/json'})
                 response = connection.getresponse()
                 status = response.status
                 # Bounded overall response read, including slow streaming peers.
-                deadline = min(time.monotonic() + timeout,
-                               absolute_deadline if absolute_deadline is not None else float('inf'))
+                deadline = response_deadline
                 raw = bytearray()
                 while len(raw) <= MAX_BODY:
                     remaining = deadline - time.monotonic()
@@ -202,6 +211,8 @@ class DockerMutationClient:
                     if not part:
                         break
                     raw.extend(part)
+                if time.monotonic() >= deadline:
+                    raise ExecutionError('writer-response-unknown', may_have_mutated=True)
             if len(raw) > MAX_BODY or status != expected:
                 raise ExecutionError('writer-http-rejected', may_have_mutated=True)
             if expected == 201:
@@ -221,6 +232,8 @@ class DockerMutationClient:
         except Exception:
             raise ExecutionError(phase, may_have_mutated=attempted) from None
         finally:
+            if watchdog is not None:
+                watchdog.cancel()
             if response is not None:
                 try:
                     response.close()

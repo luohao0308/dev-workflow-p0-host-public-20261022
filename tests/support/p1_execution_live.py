@@ -217,6 +217,19 @@ def main():
         old = collector.collect()
         save(output / 'initial-observation.json', old.to_dict())
         assert old.to_dict()['complete'] is True, old.to_dict()['incomplete']
+        # Independent server-side restrictions, not just client method guards.
+        readonly_policy = replace(epolicy, writer_certificate_sha256=cert_hash('reader'))
+        readonly_writer = execution.DockerMutationClient(readonly_policy, ca_file=directory / 'ca.pem',
+            cert_file=directory / 'reader.pem', key_file=directory / 'reader.key')
+        body = images[('web', '2.0.0')][1].to_create(project, 'f' * 64)
+        expect_rejected(lambda: readonly_writer.create('dwf-' + 'f' * 64, body, before_send=lambda: None))
+        api_id = next(item['containerId'] for item in old.to_dict()['instances'] if item['component'] == 'api')
+        expect_rejected(lambda: client.stop(api_id, before_send=lambda: None))
+        bad_policy = replace(epolicy, runtime_policy=replace(policy, server_certificate_sha256='0' * 64))
+        bad_pin = execution.DockerMutationClient(bad_policy, ca_file=directory / 'ca.pem',
+            cert_file=directory / 'writer.pem', key_file=directory / 'writer.key')
+        expect_rejected(lambda: bad_pin.create('dwf-' + 'f' * 64, body, before_send=lambda: None))
+        collector.recheck(old)
         records = candidate / sdk.RECORDS
         records.mkdir(parents=True)
         save(records / 'conditions.json', dict(schemaVersion=1, kind='deployment-conditions', environment='staging',
@@ -295,7 +308,8 @@ def main():
         save(output / 'summary.json', dict(result='passed', realDocker=True, realMTLS=True,
             realGitHubOIDC=not smoke, authority='synthetic-test-double' if smoke else 'github-oidc-exact-review-cas',
             productDeploymentExecuted=True, productRollbackExecuted=True, preservedApiInstance=True,
-            restoredHistoricalIdentity=True, mutations=mutations, productionReady=False))
+            restoredHistoricalIdentity=True, readerWriteDenied=True, unselectedWriteDenied=True,
+            wrongPinDenied=True, mutations=mutations, productionReady=False))
     finally:
         if server:
             server.shutdown()
