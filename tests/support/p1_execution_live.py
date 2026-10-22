@@ -179,6 +179,10 @@ def main():
                 (context / filename).write_bytes(raw)
             image_id = run('docker', 'build', '--quiet', '--label', 'fixture-component=' + component, str(context))
             inspected = json.loads(run('docker', 'image', 'inspect', image_id))[0]
+            source = inspected.get('Config', {})
+            save(output / 'image-policy.json', dict(volumesPresent=bool(source.get('Volumes')),
+                onBuildPresent=bool(source.get('OnBuild')), healthcheckPresent=bool(source.get('Healthcheck')),
+                stopSignalPresent=bool(source.get('StopSignal')), argsEscaped=source.get('ArgsEscaped')))
             definition = specs.ContainerSpec.from_image(component, inspected)
             definitions.append(definition)
             images[(component, version)] = (image_id, definition)

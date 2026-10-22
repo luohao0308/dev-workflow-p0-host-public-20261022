@@ -94,6 +94,17 @@ class ContainerSpecTests(unittest.TestCase):
             with self.subTest(field=field), self.assertRaises(ValueError):
                 specification.ContainerSpec.from_image('web', image)
 
+    def test_linux_legacy_args_escaped_flag_has_no_windows_semantics(self):
+        image = image_fixture()
+        image['Config']['ArgsEscaped'] = True
+        spec = specification.ContainerSpec.from_image('web', image)
+        inspected = inspect_fixture(spec)
+        inspected['Config']['ArgsEscaped'] = True
+        self.assertTrue(spec.matches(inspected))
+        image['Os'] = 'windows'
+        with self.assertRaises(ValueError):
+            specification.ContainerSpec.from_image('web', image)
+
     def test_running_port_publication_must_match_actual_mappings(self):
         bindings = {'8080/tcp': [{'HostIp': '127.0.0.1', 'HostPort': '18080'}]}
         spec = specification.ContainerSpec.from_image('web', image_fixture(), port_bindings=bindings)

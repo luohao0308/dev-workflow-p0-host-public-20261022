@@ -194,7 +194,7 @@ CONFIG_DEFAULTS = {'Domainname': ('',), 'AttachStdin': (False,), 'AttachStdout':
                    'AttachStderr': (False, True), 'Tty': (False,), 'OpenStdin': (False,),
                    'StdinOnce': (False,), 'Volumes': (None, {}), 'NetworkDisabled': (False,),
                    'MacAddress': ('',), 'StopSignal': ('', 'SIGTERM'), 'StopTimeout': (None, 10),
-                   'Healthcheck': (None, {}), 'OnBuild': (None, []), 'ArgsEscaped': (False,)}
+                   'Healthcheck': (None, {}), 'OnBuild': (None, []), 'ArgsEscaped': (False, True)}
 
 
 def _default_equal(value, alternatives):
@@ -236,7 +236,7 @@ class ContainerSpec:
         if (source.get('Volumes') not in (None, {}) or source.get('OnBuild') not in (None, [])
                 or source.get('Healthcheck') not in (None, {})
                 or source.get('StopSignal') not in (None, '', 'SIGTERM')
-                or source.get('ArgsEscaped') not in (None, False)):
+                or (source.get('ArgsEscaped') is not None and type(source['ArgsEscaped']) is not bool)):
             raise SpecificationError('Unsupported image configuration')
         config = _config({key: source[key] for key in CONFIG if key in source})
         host = _host(network_mode, port_bindings)
