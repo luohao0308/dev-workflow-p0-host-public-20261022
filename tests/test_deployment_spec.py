@@ -60,8 +60,9 @@ def inspect_fixture(spec=None, container_id=CONTAINER_ID):
             'HostsPath': '/var/lib/docker/containers/' + container_id + '/hosts',
             'HostnamePath': '/var/lib/docker/containers/' + container_id + '/hostname',
             'ResolvConfPath': '/var/lib/docker/containers/' + container_id + '/resolv.conf',
-            'NetworkSettings': {'Networks': {'bridge': {'IPAddress': '172.17.0.2',
-                                                       'EndpointID': 'e' * 64}}},
+            'NetworkSettings': {'Ports': deepcopy(host['PortBindings']),
+                                'Networks': {host['NetworkMode']: {'IPAddress': '172.17.0.2',
+                                                                 'EndpointID': 'e' * 64}}},
             'State': {'Running': True, 'Paused': False, 'Restarting': False, 'Dead': False,
                       'Status': 'running', 'Pid': 123, 'StartedAt': '2026-01-01T00:00:00.000000000Z'}}
 
@@ -97,6 +98,7 @@ class ContainerSpecTests(unittest.TestCase):
         bindings = {'8080/tcp': [{'HostIp': '127.0.0.1', 'HostPort': '18080'}]}
         spec = specification.ContainerSpec.from_image('web', image_fixture(), port_bindings=bindings)
         inspected = inspect_fixture(spec)
+        inspected['NetworkSettings'].pop('Ports')
         self.assertFalse(spec.matches(inspected))
         inspected['NetworkSettings']['Ports'] = bindings
         self.assertTrue(spec.matches(inspected))

@@ -305,7 +305,10 @@ class ContainerSpec:
             if canonical(actual) != canonical(expected):
                 return False
             if container.get('State', {}).get('Running') is True:
-                ports = container.get('NetworkSettings', {}).get('Ports')
+                settings = container.get('NetworkSettings', {})
+                if set(settings.get('Networks', {})) != {expected['NetworkMode']}:
+                    return False
+                ports = settings.get('Ports')
                 if ports is None:
                     if expected['PortBindings']:
                         return False

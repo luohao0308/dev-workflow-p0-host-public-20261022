@@ -201,7 +201,7 @@ def main():
             ca_file=directory / 'ca.pem', cert_file=directory / 'reader.pem', key_file=directory / 'reader.key'))
         epolicy = execution.ExecutionPolicy(policy, cert_hash('writer'))
         client = execution.DockerMutationClient(epolicy, ca_file=directory / 'ca.pem',
-                                               cert_file=directory / 'writer.pem', key_file=directory / 'writer.key')
+                                               cert_file=directory / 'writer.pem', key_file=directory / 'writer.key', timeout=30)
         executor = execution.DockerExecutor(epolicy, client, collector)
         old = collector.collect()
         save(output / 'initial-observation.json', old.to_dict())

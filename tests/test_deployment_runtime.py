@@ -681,7 +681,10 @@ class SpecificationRuntimeTests(unittest.TestCase):
                 else:
                     selected['Config']['Labels']['dev-workflow.execution-id'] = 'changed'
                 after = c.collect()
-                self.assertEqual(before.snapshot()['components'], after.snapshot()['components'])
+                if field == 'hostname':
+                    self.assertFalse(after.to_dict()['complete'])
+                else:
+                    self.assertEqual(before.snapshot()['components'], after.snapshot()['components'])
                 self.assertNotEqual(before.state_hash, after.state_hash)
                 with self.subTest(component=component, field=field), self.assertRaises(runtime.RuntimeCollectionError):
                     c.recheck(before)

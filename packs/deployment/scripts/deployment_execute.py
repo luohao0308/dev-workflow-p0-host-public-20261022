@@ -148,6 +148,10 @@ class DockerMutationClient:
                 or (method == 'DELETE' and expected == 204 and body is None
                     and re.fullmatch(r'/v1\.45/containers/[0-9a-f]{64}\?force=false&v=false', path)))):
             raise ExecutionError('writer-route-rejected')
+        try:
+            wire_body = canonical(body).encode('ascii') if body is not None else None
+        except Exception:
+            raise ExecutionError('writer-payload-rejected') from None
         connection = response = None
         attempted = False
         phase = 'writer-connect-failed'
@@ -168,7 +172,7 @@ class DockerMutationClient:
                 status, value = self._transport(method, path, body)
                 raw = canonical(value).encode('ascii') if value is not None else b''
             else:
-                connection.request(method, path, body=canonical(body).encode('ascii') if body is not None else None,
+                connection.request(method, path, body=wire_body,
                                    headers={'Content-Type': 'application/json', 'Accept': 'application/json'})
                 response = connection.getresponse()
                 status = response.status
@@ -197,15 +201,23 @@ class DockerMutationClient:
             if raw:
                 raise ExecutionError('writer-response-unverified', may_have_mutated=True)
             return None
-        except ExecutionError:
+        except ExecutionError as error:
+            if attempted and not error.may_have_mutated:
+                raise ExecutionError('writer-response-unknown', may_have_mutated=True) from None
             raise
         except Exception:
             raise ExecutionError(phase, may_have_mutated=attempted) from None
         finally:
             if response is not None:
-                response.close()
+                try:
+                    response.close()
+                except Exception:
+                    pass
             if connection is not None:
-                connection.close()
+                try:
+                    connection.close()
+                except Exception:
+                    pass
 
 
 @dataclass(frozen=True, eq=False)

@@ -5,6 +5,7 @@ No Docker socket, image pull, external host, credentials, or product checkout.
 from copy import deepcopy
 from dataclasses import FrozenInstanceError, replace
 from datetime import timedelta
+import errno
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -397,15 +398,20 @@ class DeploymentExecuteTests(unittest.TestCase):
     def test_root_change_during_last_runtime_read_blocks_next_write(self):
         permit = self.authorize()
         original = self.engine._stage
+        candidate_checks = 0
         def drift(record, stage, new_id, deadline):
+            nonlocal candidate_checks
             original(record, stage, new_id, deadline)
             if stage == 1:
-                path = self.root / 'workflow.config.json'
-                path.write_text(path.read_text() + '\n')
+                candidate_checks += 1
+                if candidate_checks == 2:
+                    path = self.root / 'workflow.config.json'
+                    path.write_text(path.read_text() + '\n')
         with mock.patch.object(self.engine, '_stage', side_effect=drift):
             result = self.engine.execute(self.root, permit, self.intent)
         self.assertEqual(result['status'], 'executed-unverified')
         self.assertEqual(len(self.docker.writes), 1)
+        self.assertEqual(candidate_checks, 2)
         self.assertTrue(self.docker.containers[OLD]['State']['Running'])
 
     def test_http_failure_is_ambiguous_even_if_fake_did_not_mutate(self):
@@ -507,6 +513,10 @@ class DeploymentExecuteTests(unittest.TestCase):
             self.client.stop(OLD, before_send=lambda: None)
         self.assertTrue(caught.exception.may_have_mutated)
         self.assertNotIn(SECRET, str(caught.exception))
+        self.client._transport = lambda *_: (_ for _ in ()).throw(backend.ExecutionError('transport-failure'))
+        with self.assertRaises(backend.ExecutionError) as caught:
+            self.client.stop(OLD, before_send=lambda: None)
+        self.assertTrue(caught.exception.may_have_mutated)
 
     def test_internal_writer_route_allowlist_rejects_unsafe_operations(self):
         for method, path in (('POST', '/v1.45/images/create'), ('POST', '/v1.45/containers/' + OLD + '/exec'),
@@ -557,7 +567,12 @@ class LocalMutationTLSTests(unittest.TestCase):
         context.load_cert_chain(str(self.directory / 'server.pem'), str(self.directory / 'server.key'))
         context.load_verify_locations(str(self.directory / 'ca.pem'))
         context.verify_mode = ssl.CERT_REQUIRED
-        server = ThreadingHTTPServer(('localhost', 0), Handler)
+        try:
+            server = ThreadingHTTPServer(('localhost', 0), Handler)
+        except OSError as error:
+            if error.errno in (errno.EPERM, errno.EACCES):
+                self.skipTest('Sandbox denies local loopback listeners; real mTLS unverified here')
+            raise
         server.socket = context.wrap_socket(server.socket, server_side=True)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
