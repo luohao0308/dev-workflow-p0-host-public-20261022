@@ -225,7 +225,30 @@ def exercise(state):
             expires_at=(datetime.now(timezone.utc) + timedelta(minutes=40)).isoformat())
         real = os.environ.get('P15_REAL_AUTHORITY') == 'true'
         approval = actual_approval(config, request, output) if real else RecoveryTestApproval()
-        result = coordinator.recover(request, approval)
+        original_inventory = execution.DockerExecutor._inventory
+        prior_inventory = {}
+        def diagnostic_inventory(executor_instance, deadline):
+            nonlocal prior_inventory
+            current = original_inventory(executor_instance, deadline)
+            for cid in set(current).intersection(prior_inventory):
+                previous, actual = prior_inventory[cid], current[cid]
+                if (not previous.get('State', {}).get('Running')
+                        and actual.get('State', {}).get('Running')):
+                    # Keys only: never export raw configuration or private Env.
+                    provision.save(output / 'start-transition-diagnostics.json', dict(
+                        changedFields=sorted(k for k in set(previous) | set(actual)
+                            if previous.get(k) != actual.get(k)),
+                        changedConfigFields=sorted(k for k in set(previous.get('Config', {})) | set(actual.get('Config', {}))
+                            if previous.get('Config', {}).get(k) != actual.get('Config', {}).get(k)),
+                        changedHostConfigFields=sorted(k for k in set(previous.get('HostConfig', {})) | set(actual.get('HostConfig', {}))
+                            if previous.get('HostConfig', {}).get(k) != actual.get('HostConfig', {}).get(k))))
+            prior_inventory = current
+            return current
+        execution.DockerExecutor._inventory = diagnostic_inventory
+        try:
+            result = coordinator.recover(request, approval)
+        finally:
+            execution.DockerExecutor._inventory = original_inventory
         observation = result.pop('observation')
         provision.save(output / 'recovery-result.json', result)
         assert result['status'] == 'recovered-runtime-verified', result
