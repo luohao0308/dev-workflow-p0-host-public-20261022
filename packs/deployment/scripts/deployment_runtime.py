@@ -22,6 +22,7 @@ import secrets
 import ssl
 import sys
 import tarfile
+import threading
 import time
 from urllib.parse import urlencode, urlsplit
 
@@ -329,6 +330,8 @@ class TrustedDockerCollector:
         # Object identity and retained references prevent exported/reconstructed objects
         # (including dataclass copies) from acquiring in-process issuance authority.
         self._issued = {}
+        self._issuance_lock = threading.Lock()
+        self._sequence = 0
 
     def _read(self, path, deadline):
         if time.monotonic() >= deadline:
@@ -494,7 +497,9 @@ class TrustedDockerCollector:
             evidence_hash = digest(payload)
             payload['evidenceHash'] = evidence_hash
             observation = RuntimeObservation(canonical(payload), evidence_hash, state_hash, self._policy_hash, captured_at)
-            self._issued[id(observation)] = (observation, time.monotonic())
+            with self._issuance_lock:
+                self._sequence += 1
+                self._issued[id(observation)] = (observation, time.monotonic(), self._sequence)
             return observation
         except RuntimeCollectionError:
             raise
@@ -511,7 +516,7 @@ class TrustedDockerCollector:
             raise RuntimeCollectionError('Runtime observation is incomplete')
         if before is not None:
             self.validate_history(before)
-            if observation is before or record[1] >= self._issued[id(before)][1]:
+            if observation is before or record[2] >= self._issued[id(before)][2]:
                 raise RuntimeCollectionError('Runtime history must precede the baseline observation')
         return observation
 

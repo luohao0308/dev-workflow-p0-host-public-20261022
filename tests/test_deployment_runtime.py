@@ -234,8 +234,11 @@ class RuntimeTests(unittest.TestCase):
             c.validate_history(earlier, before=replace(baseline))
         with mock.patch.object(runtime.time, 'monotonic', return_value=c._issued[id(earlier)][1]):
             same_time = c.collect()
+        # Windows Python 3.10 monotonic ticks can coincide for distinct captures.
+        # Collector-owned sequence establishes issuance order independently.
+        self.assertIs(c.validate_history(earlier, before=same_time), earlier)
         with self.assertRaises(runtime.RuntimeCollectionError):
-            c.validate_history(earlier, before=same_time)
+            c.validate_history(same_time, before=earlier)
 
     def test_independent_exports(self):
         c, _ = collector()
