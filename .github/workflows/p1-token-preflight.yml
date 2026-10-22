@@ -1,0 +1,20 @@
+name: P1 authority token preflight
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+  actions: read
+  deployments: read
+  id-token: write
+jobs:
+  read-authority:
+    runs-on: ubuntu-latest
+    environment: p1-observer
+    steps:
+      - name: Read authority settings without credentials in output
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api repos/luohao0308/dev-workflow-p0-host-public-20261022/actions/oidc/customization/sub --jq '{use_default,use_immutable_subject}'
+          gh api repos/luohao0308/dev-workflow-p0-host-public-20261022/environments/p1-deploy-approval --jq '{id,name,can_admins_bypass}'
+          gh api repos/luohao0308/dev-workflow-p0-host-public-20261022/environments/p1-rollback-approval --jq '{id,name,can_admins_bypass}'
