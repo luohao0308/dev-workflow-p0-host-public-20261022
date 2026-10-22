@@ -598,6 +598,136 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
 
 
+class SpecificationRuntimeTests(unittest.TestCase):
+    def fixture(self, *, components=('web',)):
+        from tests.test_deployment_spec import image_fixture, inspect_fixture
+        spec_api = runtime.deployment_spec
+        fixture = DockerFixture()
+        fixture.image = image_fixture()
+        specs = tuple(spec_api.ContainerSpec.from_image(name, fixture.image) for name in components)
+        containers = {('b' if index == 0 else 'e') * 64: inspect_fixture(spec, ('b' if index == 0 else 'e') * 64)
+                      for index, spec in enumerate(specs)}
+        data = catalog()
+        data['images'] = [dict(deepcopy(data['images'][0]), component=name) for name in components]
+        p = policy(components=components, catalog_json=json.dumps(data),
+                   specifications_json=spec_api.specifications_json(specs))
+        def transport(path):
+            if path.startswith('/v1.45/containers/json?'):
+                return [{'Id': cid, 'Labels': value['Config']['Labels']} for cid, value in containers.items()]
+            if path.startswith('/v1.45/containers/') and path.endswith('/json'):
+                return deepcopy(containers[path.split('/')[3]])
+            return fixture(path)
+        c, _ = collector(p, transport)
+        return c, fixture, containers, specs
+
+    def test_recreation_stable_spec_digest_but_new_state_and_instance(self):
+        from tests.test_deployment_spec import inspect_fixture, SECRET as SPEC_SECRET
+        c, fixture, containers, specs = self.fixture()
+        before = c.collect()
+        self.assertEqual(before.snapshot()['components'][0]['configurationDigest'], specs[0].configuration_digest())
+        containers.clear()
+        replacement = inspect_fixture(specs[0], 'f' * 64)
+        replacement['State'].update(Pid=456, StartedAt='2026-02-01T00:00:00.000000000Z')
+        replacement['NetworkSettings']['Networks']['bridge'].update(IPAddress='172.17.0.3', EndpointID='d' * 64)
+        replacement['Config']['Labels']['dev-workflow.execution-id'] = 'replacement'
+        containers[replacement['Id']] = replacement
+        fixture.files['hostname'] = b'new-generated-hostname'
+        after = c.collect()
+        self.assertEqual(before.snapshot()['components'], after.snapshot()['components'])
+        self.assertEqual(before.snapshot()['version'], after.snapshot()['version'])
+        self.assertNotEqual(before.state_hash, after.state_hash)
+        self.assertNotEqual(before.to_dict()['instances'], after.to_dict()['instances'])
+        with self.assertRaisesRegex(runtime.RuntimeCollectionError, 'changed'):
+            c.recheck(before)
+        for private in (SPEC_SECRET, 'HostConfig', 'Env', 'TOKEN=', 'observedConfigurations'):
+            self.assertNotIn(private, after.payload_json)
+
+    def test_config_mismatch_and_missing_spec_have_no_snapshot_authority(self):
+        changes = [lambda x: x['Config']['Env'].append('DRIFT=1'),
+                   lambda x: x['Config']['Labels'].update(custom='changed'),
+                   lambda x: x['HostConfig'].update(Memory=128)]
+        for change in changes:
+            c, _, containers, _ = self.fixture()
+            change(containers[CID])
+            observation = c.collect()
+            self.assertFalse(observation.to_dict()['complete'])
+            self.assertIn('specification-mismatch:web', observation.to_dict()['incomplete'])
+            with self.assertRaises(runtime.RuntimeCollectionError):
+                c.validate(observation)
+            with self.assertRaises(runtime.RuntimeCollectionError):
+                observation.snapshot()
+        c, fixture, containers, _ = self.fixture()
+        missing = replace(c.policy, specifications_json=runtime.deployment_spec.specifications_json(()))
+        c, _ = collector(missing, c.client._transport)
+        observation = c.collect()
+        self.assertIn('specification-missing:web', observation.to_dict()['incomplete'])
+        with self.assertRaises(runtime.RuntimeCollectionError):
+            observation.snapshot()
+
+    def test_raw_generated_drift_retained_for_every_component(self):
+        for component in ('web', 'api'):
+            for field in ('hostname', 'network', 'path', 'managed', 'label'):
+                c, fixture, containers, _ = self.fixture(components=('web', 'api'))
+                before = c.collect()
+                selected = next(x for x in containers.values() if x['Config']['Labels']['com.docker.compose.service'] == component)
+                if field == 'hostname':
+                    selected['Config']['Hostname'] = 'generated-drift'
+                elif field == 'network':
+                    selected['NetworkSettings']['Networks']['bridge']['IPAddress'] = '172.17.0.99'
+                elif field == 'path':
+                    selected['Path'] = '/different-effective-path'
+                elif field == 'managed':
+                    fixture.files['hosts'] += b'127.0.0.2 changed'
+                else:
+                    selected['Config']['Labels']['dev-workflow.execution-id'] = 'changed'
+                after = c.collect()
+                self.assertEqual(before.snapshot()['components'], after.snapshot()['components'])
+                self.assertNotEqual(before.state_hash, after.state_hash)
+                with self.subTest(component=component, field=field), self.assertRaises(runtime.RuntimeCollectionError):
+                    c.recheck(before)
+
+    def test_profile_policy_binding_canonical_json_and_legacy_hash(self):
+        c, _, _, _ = self.fixture()
+        p = c.policy
+        self.assertEqual(p.identity_hash(), replace(p, specifications_json=json.dumps(json.loads(p.specifications_json), indent=2)).identity_hash())
+        self.assertNotEqual(p.identity_hash(), replace(p, specifications_json=None).identity_hash())
+        legacy = policy()
+        original = asdict(legacy)
+        del original['specifications_json']
+        original['catalog_json'] = json.loads(legacy.catalog_json)
+        self.assertEqual(legacy.identity_hash(), runtime.digest(original))
+        for raw in ('{}', 'null', '{invalid', '{"schemaVersion":true,"kind":"docker-spec-catalog","specifications":[]}'):
+            with self.assertRaises(runtime.RuntimeCollectionError):
+                replace(p, specifications_json=raw)
+        from tests.test_deployment_spec import image_fixture
+        foreign = runtime.deployment_spec.ContainerSpec.from_image('foreign', image_fixture())
+        with self.assertRaises(runtime.RuntimeCollectionError):
+            replace(p, specifications_json=runtime.deployment_spec.specifications_json((foreign,)))
+
+    def test_spec_profile_requires_linux_even_if_catalog_allows_other_platform(self):
+        c, fixture, _, _ = self.fixture()
+        fixture.image['Os'] = 'windows'
+        data = json.loads(c.policy.catalog_json)
+        data['images'][0]['os'] = 'windows'
+        p = replace(c.policy, catalog_json=json.dumps(data))
+        c, _ = collector(p, c.client._transport)
+        observation = c.collect()
+        self.assertIn('unsupported-platform:web', observation.to_dict()['incomplete'])
+        with self.assertRaises(runtime.RuntimeCollectionError):
+            observation.snapshot()
+
+    def test_wrong_image_spec_not_selected_by_labels(self):
+        c, fixture, containers, _ = self.fixture()
+        wrong = 'sha256:' + 'f' * 64
+        containers[CID]['Image'] = wrong
+        fixture.image['Id'] = wrong
+        original = c.client._transport
+        c.client._transport = lambda path: deepcopy(fixture.image) if path == '/v1.45/images/' + wrong + '/json' else original(path)
+        observation = c.collect()
+        self.assertFalse(observation.to_dict()['complete'])
+        self.assertIn('specification-missing:web', observation.to_dict()['incomplete'])
+
+
 @unittest.skipUnless(shutil.which('openssl'), 'openssl required for local mTLS fixture')
 class LocalTLSRuntimeTests(unittest.TestCase):
     @classmethod

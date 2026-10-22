@@ -80,6 +80,31 @@ class DeploymentHostTests(unittest.TestCase):
             approval.consume(grant, self.req)
         self.assertEqual(self.client.posts, 1)
 
+    def test_execution_requires_a_separately_bound_host_policy(self):
+        binding = execution.canonical(dict(profile='docker-container-replace-v1',
+                                             policyHash='1' * 64, component='api'))
+        self.req = replace(self.req, execution_json=binding)
+        self.client = self.client_for([self.req])
+        with self.assertRaises(AuthorizationUnavailable):
+            self.make_host()
+        self.policy = replace(self.policy, execution_policy_hash='1' * 64)
+        self.claims = dict(claims(self.policy), aud=host.AUDIENCE)
+        self.client = self.client_for([self.req])
+        self.assertEqual(self.make_host().validate(self.req).request_hash, self.req.digest())
+        for binding in (dict(profile='docker-container-replace-v1', policyHash='2' * 64, component='api'),
+                        dict(profile='docker-container-replace-v1', policyHash='1' * 64, component='web')):
+            req = replace(self.req, execution_json=execution.canonical(binding))
+            with self.subTest(binding=binding), self.assertRaises(AuthorizationUnavailable):
+                self.make_host([req])
+
+    def test_execution_policy_changes_the_exact_review_digest(self):
+        configured = replace(self.policy, execution_policy_hash='1' * 64)
+        self.assertNotEqual(release.bundle_digest([self.req], self.policy.expires_at, self.policy.bundle_context()),
+                            release.bundle_digest([self.req], configured.expires_at, configured.bundle_context()))
+        for value in ('bad', 1, True):
+            with self.subTest(value=value), self.assertRaises(AuthorizationUnavailable):
+                replace(self.policy, execution_policy_hash=value)
+
     def test_both_deployment_operations(self):
         rollback = request('deployment-rollback')
         requests = [self.req, rollback]

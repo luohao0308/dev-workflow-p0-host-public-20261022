@@ -27,6 +27,8 @@ import time
 from urllib.parse import urlencode, urlsplit
 
 sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import deployment_spec
 HEX = re.compile(r'[0-9a-f]{64}\Z')
 ID = re.compile(r'sha256:[0-9a-f]{64}\Z')
 CONTAINER = re.compile(r'[0-9a-f]{64}\Z')
@@ -85,6 +87,7 @@ class RuntimePolicy:
     catalog_json: str
     maximum_age: int = 3600
     capture_deadline: int = 30
+    specifications_json: str | None = None
 
     def __post_init__(self):
         try:
@@ -113,10 +116,22 @@ class RuntimePolicy:
                 or type(self.capture_deadline) is not int or not 1 <= self.capture_deadline <= 300):
             raise RuntimeCollectionError('Invalid runtime observation time limits')
         _catalog(self)
+        if self.specifications_json is not None:
+            try:
+                specs = deployment_spec.parse_specifications(self.specifications_json)
+                if any(component not in self.components for component, _ in specs):
+                    raise ValueError
+            except (ValueError, TypeError):
+                raise RuntimeCollectionError('Invalid trusted specification catalog') from None
 
     def identity_hash(self):
         value = asdict(self)
         value['catalog_json'] = parse_json(self.catalog_json)
+        if self.specifications_json is None:
+            # Preserve the exact observed-v2 policy identity for existing hosts.
+            del value['specifications_json']
+        else:
+            value['specifications_json'] = parse_json(self.specifications_json)
         return digest(value)
 
 
@@ -327,6 +342,8 @@ class TrustedDockerCollector:
         self.policy, self.client = policy, client
         self._policy_hash = policy.identity_hash()
         self._catalog = _catalog(policy)
+        self._specifications = (None if policy.specifications_json is None else
+                                deployment_spec.parse_specifications(policy.specifications_json))
         # Object identity and retained references prevent exported/reconstructed objects
         # (including dataclass copies) from acquiring in-process issuance authority.
         self._issued = {}
@@ -376,6 +393,7 @@ class TrustedDockerCollector:
         if any(len(items) != 1 for items in selected.values()):
             raise RuntimeCollectionError('Runtime requires exactly one container per component')
         mapping, instances, versions, incomplete = [], [], {}, []
+        observed_configurations = {}
         for name in sorted(selected):
             container = selected[name][0]
             state = container.get('State')
@@ -450,6 +468,19 @@ class TrustedDockerCollector:
                           'Config': config, 'HostConfig': host, 'Path': container.get('Path'), 'Args': container.get('Args'),
                           'managedFiles': managed, 'Networks': networks}
             configuration = 'sha256:' + digest(projection)
+            if self._specifications is not None:
+                # Retain all raw v2 inputs in private drift comparison even when
+                # semantic identity deliberately omits generated Docker values.
+                observed_configurations[name] = configuration
+                if image.get('Os') != 'linux':
+                    incomplete.append('unsupported-platform:' + name)
+                spec = self._specifications.get((name, image_id))
+                if spec is None:
+                    incomplete.append('specification-missing:' + name)
+                elif not spec.matches(container):
+                    incomplete.append('specification-mismatch:' + name)
+                else:
+                    configuration = spec.configuration_digest()
             instances.append({'component': name, 'containerId': container['Id'], 'imageId': image_id,
                               'startedAt': state['StartedAt'], 'pid': state['Pid'], 'status': state['Status'],
                               'running': True, 'paused': False, 'restarting': False})
@@ -463,7 +494,10 @@ class TrustedDockerCollector:
                 # Include configuration and image identities in drift comparison even
                 # when no trusted source binding exists and no snapshot can be used.
                 mapping.append({'name': name, 'imageId': image_id, 'configurationDigest': configuration})
-        return {'components': mapping, 'instances': instances, 'versions': versions, 'incomplete': incomplete}
+        result = {'components': mapping, 'instances': instances, 'versions': versions, 'incomplete': incomplete}
+        if self._specifications is not None:
+            result['observedConfigurations'] = observed_configurations
+        return result
 
     def collect(self):
         began = time.monotonic()

@@ -18,7 +18,9 @@ GitHub 授权宿主复用完整可信分发的 release 基础模块；这是分�
 
 Compose project/service labels 仅用于选择成员，不证明来源、版本或产物身份。每组件必须恰好一个 running、未 paused/restarting/dead 的容器；实际容器 `.Image` 必须等于镜像 inspect 的不可变 `Id`。可信 catalog 由宿主维护，schema v1 的每项绑定 component、imageId、repository、完整 sourceSha、语义版本、os、architecture、artifact 和 migration。实际平台必须匹配；local-build 的 imageId/buildSourceSha 必须匹配 catalog，registry 引用必须精确出现在实际 RepoDigests。来源 SHA 是可信 catalog 对实测镜像的绑定，不从 labels 或目标清单补造。缺失 catalog、未知来源或迁移不能借用目标值。
 
-首个完整 profile 仅支持不可变镜像、`ReadonlyRootfs=true`、无 bind/volume/tmpfs 等挂载及其他镜像外配置依赖、无特权/设备/共享宿主命名空间、无数据库、无需迁移的工作负载；catalog 必须显式声明 `migration.mode=none`。未知迁移或不支持的文件系统产生 `complete=false`，无可用 snapshot/授权；数据库、备份、恢复和迁移能力未由此交付。
+首个完整 profile 仅支持 Linux 容器（SDK 可跨平台连接远端 Linux Docker）、不可变镜像、`ReadonlyRootfs=true`、无 bind/volume/tmpfs 等挂载及其他镜像外配置依赖、无特权/设备/宿主 PID/IPC/网络/UTS 共享、无数据库、无需迁移的工作负载；catalog 必须显式声明 `migration.mode=none`。未知迁移或不支持的文件系统产生 `complete=false`，无可用 snapshot/授权；数据库、备份、恢复和迁移能力未由此交付。
+
+这里的 complete 指受支持的 Docker 实例、声明配置和管理文件已完整采集，不验证应用内存缓存、远端配置服务或外部系统的数据。需要这些证据的工作负载不能仅凭本 profile 授权；宿主须另外补齐可信证据，当前无相应采集适配器。
 
 在期限内进行两轮完整读取，包含两次 daemon 校验，结果必须相等。这证明两次读取稳定，不是跨 Docker API 的原子快照，不能排除读取之间变化后恢复。配置摘要为版本化 canonical 投影：`schemaVersion=2`、`kind=docker-container-configuration`、inspect 的 `Config`、`HostConfig`、`Path`、`Args`、实际网络连接和三个 Docker 管理文件的内容摘要。管理文件通过固定路径的只读 archive 获取，仅接受有大小上限的普通文件；不解压到宿主文件系统，也不把路径存在当作内容证明。Env 等私密值参与哈希但不导出；摘要不加密，仍需限制访问。输出不含原始 Env/Config/HostConfig、凭据、原始 API 响应或异常。
 
@@ -27,7 +29,7 @@ Compose project/service labels 仅用于选择成员，不证明来源、版本�
 | `policy_hash` | 固定采集范围与可信策略 |
 | `state_hash` | 全组件映射、实例 container/image ID、启动时间、PID 等状态，重启也触发漂移 |
 | `evidence_hash` | 本次 payload（含采集时间和 nonce）的身份 |
-| snapshot `version` | `runtime-` 加完整组件映射哈希；全环境运行身份，非业务 release alias，单纯重启不改变它 |
+| snapshot `version` | `runtime-` 加完整组件映射哈希；全环境运行身份，非业务 release alias，不直接包含 PID/启动时间；配置映射不变时重启不改变它，Docker 生成配置或网络变化仍会改变它 |
 
 各组件语义版本另列于 observation，不拿目标业务标签冒充当前全局 runtime version。`RuntimeObservation.snapshot()` 仅对 complete 返回 schema-v1 快照。collector 在自身内存中保留签发对象；`validate` 验证对象身份、范围与新鲜度，`recheck` 重新采集并拒绝 state_hash 漂移，不更新已审核基线。`to_dict()` 导出 JSON 仅为证据副本，重建对象、文件或另一 collector 均不能恢复证明。
 

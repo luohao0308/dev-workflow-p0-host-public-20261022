@@ -37,6 +37,7 @@ class DeploymentHostPolicy(HostPolicy):
     runtime_policy_hash: str
     allowed_components: tuple[str, ...]
     approval_environment: str
+    execution_policy_hash: str | None = None
 
     def __post_init__(self):
         super().__post_init__()
@@ -48,6 +49,10 @@ class DeploymentHostPolicy(HostPolicy):
             _deny('Invalid trusted deployment production policy')
         if not isinstance(self.runtime_policy_hash, str) or not re.fullmatch(r'[0-9a-f]{64}', self.runtime_policy_hash):
             _deny('Invalid trusted runtime policy hash')
+        if (self.execution_policy_hash is not None
+                and (not isinstance(self.execution_policy_hash, str)
+                     or not re.fullmatch(r'[0-9a-f]{64}', self.execution_policy_hash))):
+            _deny('Invalid trusted execution policy hash')
         if (type(self.allowed_components) is not tuple or not self.allowed_components
                 or any(not portable_identifier(value) for value in self.allowed_components)
                 or len(set(self.allowed_components)) != len(self.allowed_components)):
@@ -89,6 +94,15 @@ class GitHubDeploymentApproval(GitHubActionsApproval):
             _deny('Reviewed deployment components differ from host policy')
         if type(request.max_uses) is not int or request.max_uses != 1:
             _deny('Deployment authorization requires exactly one use')
+        if request.execution_json is not None:
+            import json
+            binding = json.loads(request.execution_json)
+            if (policy.execution_policy_hash is None
+                    or binding.get('profile') != 'docker-container-replace-v1'
+                    or binding.get('policyHash') != policy.execution_policy_hash
+                    or len(request.components) != 1
+                    or binding.get('component') != request.components[0]):
+                _deny('Execution request differs from trusted executor policy')
         try:
             expires = timestamp(request.expires_at).timestamp()
         except (TypeError, ValueError, ExecutionError):

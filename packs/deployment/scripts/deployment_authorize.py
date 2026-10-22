@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Scoped deployment/rollback authorization; no deployment executor is provided.
+"""Scoped deployment/rollback authorization for fixed trusted host embeddings.
 
 Load from a pinned trusted checkout using an isolated Python bootstrap. Import
 paths below prioritize trusted siblings; the embedding host must also control
@@ -19,6 +19,7 @@ import sys
 import tempfile
 import threading
 import uuid
+import weakref
 
 sys.dont_write_bytecode = True
 SCRIPT = Path(__file__).resolve()
@@ -34,6 +35,7 @@ DOMAIN = 'dev-workflow-deployment-authorization-v1'
 HEX = re.compile(r'[0-9a-f]{64}\Z')
 SLUG = re.compile(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z')
 RECORDS = planner.RECORDS
+_ISSUED_PERMITS = weakref.WeakSet()
 
 
 class AuthorizationError(ValueError):
@@ -77,6 +79,7 @@ class Request:
     runtime_policy_hash: str
     expires_at: str
     max_uses: int = 1
+    execution_json: str | None = None
 
     def __post_init__(self):
         if (self.operation not in OPERATIONS or not isinstance(self.repository, str) or not self.repository
@@ -96,6 +99,13 @@ class Request:
         for value in (self.before_json, self.after_json, self.conditions_json):
             if not isinstance(value, str) or canonical(json.loads(value)) != value:
                 raise AuthorizationError('Deployment request requires canonical immutable JSON')
+        if self.execution_json is not None:
+            binding = json.loads(self.execution_json)
+            if (not isinstance(binding, dict) or canonical(binding) != self.execution_json
+                    or binding.get('profile') != 'docker-container-replace-v1'
+                    or not isinstance(binding.get('policyHash'), str)
+                    or not HEX.fullmatch(binding['policyHash'])):
+                raise AuthorizationError('Invalid immutable execution binding')
         timestamp(self.expires_at)
 
     def digest(self):
@@ -135,7 +145,7 @@ def _deadline(expires):
 
 
 def build_request(root, plan, operation, *, collector, observation, repository_slug,
-                  repository_id, expires_at, rollback_target=None):
+                  repository_id, expires_at, rollback_target=None, execution_intent=None):
     if operation not in OPERATIONS:
         raise AuthorizationError('Unsupported deployment operation')
     root = Path(root).resolve()
@@ -186,6 +196,14 @@ def build_request(root, plan, operation, *, collector, observation, repository_s
         history_hash = rollback_target.evidence_hash
     elif rollback_target is not None:
         raise AuthorizationError('Deploy cannot borrow a rollback history capability')
+    execution_json = None
+    if execution_intent is not None:
+        from deployment_execute import ExecutionIntent
+        if type(execution_intent) is not ExecutionIntent:
+            raise AuthorizationError('Execution requires an issued Docker intent')
+        execution_intent.validate(root, saved, operation, collector=collector,
+                                  observation=observation, rollback_target=rollback_target)
+        execution_json = execution_intent.binding_json
     return Request(operation=operation, repository=str(root), repository_slug=repository_slug,
                    repository_id=repository_id, head_sha=saved['headSha'],
                    configuration_hash=saved['configurationHash'], environment=saved['environment'],
@@ -196,7 +214,7 @@ def build_request(root, plan, operation, *, collector, observation, repository_s
                                                    rollbackHistoryHash=history_hash)),
                    plan_hash=fingerprint(saved), observation_hash=observation.evidence_hash,
                    state_hash=observation.state_hash, runtime_policy_hash=observation.policy_hash,
-                   expires_at=expires_at)
+                   expires_at=expires_at, execution_json=execution_json)
 
 
 def validate_grant(grant, request):
@@ -245,28 +263,49 @@ def _audit(root, relative, value):
 class DeploymentPermit:
     """Host-local single-dispatch capability; JSON export is an audit only.
 
-    There is deliberately no backend or command execution here. A future
-    executor must claim immediately before its one dispatch, never load receipts
-    from files, and reconcile an uncertain dispatch before requesting new rights.
+    The executor claims immediately before its bounded operation. Exported
+    receipts are audits, never reloadable capabilities or automatic retries.
     """
-    def __init__(self, *, request, grant, receipt, check, result):
-        self.request, self.grant, self.receipt = request, grant, receipt
+    def __init__(self, *, request, grant, receipt, check, result, execution_guard=None):
+        self._request, self._grant, self._receipt = request, grant, receipt
         self._check, self._result = check, canonical(result)
+        self._execution_guard = execution_guard
         self._claimed, self._lock = False, threading.Lock()
+
+    @property
+    def request(self):
+        return self._request
+
+    @property
+    def grant(self):
+        return self._grant
+
+    @property
+    def receipt(self):
+        return self._receipt
 
     def to_dict(self):
         return json.loads(self._result)
 
     def claim_for_dispatch(self):
         with self._lock:
+            if self not in _ISSUED_PERMITS:
+                raise AuthorizationError('Deployment permit was not issued by this authority session')
             if self._claimed:
                 raise AuthorizationError('Deployment permit already claimed; no automatic retry')
             self._check()
             self._claimed = True
             return self.receipt
 
+    def guard_for_execution(self, runtime_check):
+        if (self not in _ISSUED_PERMITS or not self._claimed or self.request.execution_json is None
+                or self._execution_guard is None or not callable(runtime_check)):
+            raise AuthorizationError('A claimed execution-bound permit is required')
+        self._execution_guard(runtime_check)
 
-def authorize(root, plan, request, *, collector, observation, approval=None, rollback_target=None):
+
+def authorize(root, plan, request, *, collector, observation, approval=None, rollback_target=None,
+              execution_intent=None):
     if approval is None:
         raise AuthorizationError('Trusted deployment authority unavailable; no execution')
     if type(request) is not Request:
@@ -277,7 +316,7 @@ def authorize(root, plan, request, *, collector, observation, approval=None, rol
         fresh = build_request(root, json.loads(frozen_plan), request.operation, collector=collector,
                               observation=observation, repository_slug=request.repository_slug,
                               repository_id=request.repository_id, expires_at=request.expires_at,
-                              rollback_target=rollback_target)
+                              rollback_target=rollback_target, execution_intent=execution_intent)
         if fresh != request:
             raise AuthorizationError('Deployment request or plan changed')
     recheck()
@@ -332,7 +371,18 @@ def authorize(root, plan, request, *, collector, observation, approval=None, rol
             _audit(root, relative, result)
             raise
         _audit(root, relative, result)
-        return DeploymentPermit(request=request, grant=grant, receipt=receipt, check=final_check, result=result)
+        def execution_guard(runtime_check):
+            validate_grant(grant, request)
+            recheck()
+            approval.guard(request)
+            runtime_check()
+            # The fixed executor verifies its expected intermediate Docker state.
+            recheck()
+            validate_grant(grant, request)
+        permit = DeploymentPermit(request=request, grant=grant, receipt=receipt, check=final_check,
+                                  result=result, execution_guard=execution_guard)
+        _ISSUED_PERMITS.add(permit)
+        return permit
 
 
 def main(argv=None):

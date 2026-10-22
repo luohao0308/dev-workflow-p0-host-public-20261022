@@ -116,6 +116,33 @@ class DeploymentAuthorizeTests(unittest.TestCase):
         result['components'].clear()
         self.assertEqual(permit.to_dict()['components'], ['web'])
 
+    def test_permit_identity_fields_are_read_only(self):
+        permit = self.authorize()
+        for field in ('request', 'grant', 'receipt'):
+            with self.subTest(field=field), self.assertRaises(AttributeError):
+                setattr(permit, field, object())
+
+    def test_authorization_only_permit_cannot_guard_execution(self):
+        permit = self.authorize()
+        check = mock.Mock()
+        with self.assertRaises(sdk.AuthorizationError):
+            permit.guard_for_execution(check)
+        permit.claim_for_dispatch()
+        with self.assertRaises(sdk.AuthorizationError):
+            permit.guard_for_execution(check)
+        check.assert_not_called()
+
+    def test_reconstructed_permit_cannot_recover_authority(self):
+        issued = self.authorize()
+        fake = sdk.DeploymentPermit(request=issued.request, grant=issued.grant, receipt=issued.receipt,
+                                    check=lambda: None, result=issued.to_dict(), execution_guard=lambda check: check())
+        with self.assertRaises(sdk.AuthorizationError):
+            fake.claim_for_dispatch()
+
+    def test_execution_binding_is_immutable_canonical_and_profile_specific(self):
+        for value in ('{}', '[]', '{"profile":"other"}'):
+            with self.subTest(binding=value), self.assertRaises(sdk.AuthorizationError):
+                replace(self.request, execution_json=value)
     def test_request_and_host_types_are_frozen_and_domain_separated(self):
         grant = self.approval.validate(self.request)
         receipt = self.approval.consume(grant, self.request)
