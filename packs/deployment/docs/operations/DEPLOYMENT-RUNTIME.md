@@ -43,7 +43,7 @@ Request 固定 operation（`deployment-deploy` / `deployment-rollback`）、仓�
 
 `authorize` 在消耗前和返回 permit 前重核项目/计划、现场 observation 与宿主权限；完成远端权限查询后，紧邻账本 CAS 再执行运行状态和项目 guard。dispatch claim 的最后一次现场读取后再检查项目/计划。跨 Git、Docker 和 GitHub 的检查仍不构成原子事务，未来执行器需要衔接后端幂等及状态核对。宿主在目标项目之外的可信账本，以只允许不存在时创建 ref 的 CAS 语义记录一次消耗；重复、响应丢失或结果未知均按次数已消耗处理，停止，不退款、不自动重试/恢复。消耗后漂移也不恢复次数。最终 guard 再验证实时授权和账本；进程内 `DeploymentPermit.claim_for_dispatch()` 仅允许一次 claim，当前无执行器调用它。任何不确定调度须先核对现场和账本，再另行构建新请求，不能从旧文件自动续跑。
 
-本机审计保存于 Git 忽略且无已跟踪内容的 `.dev-workflow/releases/deployments/`，文件权限为私有；JSON、Receipt 导出和 `authorizationConsumed=true` 只说明审计/消耗结果，不是可加载的执行 capability，也不是部署成功证明。
+本机审计保存于 Git 忽略且无已跟踪内容的 `.dev-workflow/releases/deployments/`，POSIX 文件权限为 `0600`；Windows 的 `chmod` 不提供同等 ACL 隔离，嵌入宿主须提供受控目录权限。首个 GitHub 授权宿主仍运行于 Linux。JSON、Receipt 导出和 `authorizationConsumed=true` 只说明审计/消耗结果，不是可加载的执行 capability，也不是部署成功证明。
 
 ## 验收边界
 

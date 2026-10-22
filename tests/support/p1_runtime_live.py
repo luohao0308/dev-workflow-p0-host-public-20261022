@@ -23,6 +23,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'scripts'))
@@ -277,5 +278,7 @@ if __name__ == '__main__':
         # Type only: raw API, TLS and subprocess errors can contain sensitive data.
         output = ROOT / 'p1-results'
         output.mkdir(exist_ok=True)
-        save(output / 'failure.json', dict(result='failed', errorType=type(exc).__name__))
+        save(output / 'failure.json', dict(result='failed', errorType=type(exc).__name__,
+             locations=[Path(item.filename).name + ':' + str(item.lineno)
+                        for item in traceback.extract_tb(exc.__traceback__)]))
         raise SystemExit('P1 fixture failed: ' + type(exc).__name__)

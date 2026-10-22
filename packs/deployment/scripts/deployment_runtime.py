@@ -262,14 +262,15 @@ class DockerTLSClient:
             connection = http.client.HTTPSConnection(endpoint.hostname, endpoint.port or 443,
                                                      timeout=remaining, context=self._context)
             connection.connect()
-            certificate = connection.sock.getpeercert(binary_form=True)
+            peer = connection.sock
+            certificate = peer.getpeercert(binary_form=True)
             if hashlib.sha256(certificate).hexdigest() != self.policy.server_certificate_sha256:
                 raise RuntimeCollectionError('Runtime peer certificate pin mismatch')
             if deadline is not None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise RuntimeCollectionError('Runtime capture deadline exceeded')
-                connection.sock.settimeout(min(self.timeout, remaining))
+                peer.settimeout(min(self.timeout, remaining))
             connection.request('GET', path, headers={'Accept': 'application/x-tar' if binary else 'application/json'})
             response = connection.getresponse()
             if response.status != 200:
@@ -281,7 +282,8 @@ class DockerTLSClient:
                 remaining = read_deadline - time.monotonic()
                 if remaining <= 0:
                     raise RuntimeCollectionError('Runtime read deadline exceeded')
-                connection.sock.settimeout(min(self.timeout, remaining))
+                if connection.sock is not None:
+                    connection.sock.settimeout(min(self.timeout, remaining))
                 chunk = response.read1(min(65536, MAX_RESPONSE + 1 - len(raw)))
                 if not chunk:
                     break

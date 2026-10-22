@@ -2,6 +2,7 @@
 from dataclasses import FrozenInstanceError, asdict, replace
 from datetime import datetime, timedelta, timezone
 import json
+import os
 from pathlib import Path
 import shutil
 import sys
@@ -110,7 +111,8 @@ class DeploymentAuthorizeTests(unittest.TestCase):
         self.assertEqual(self.audits(), [result])
         self.assertFalse((self.root / 'MUST_NOT_EXIST').exists())
         for path in (self.root / DATA).glob('authorization-*.json'):
-            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            if os.name != 'nt':
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
         result['components'].clear()
         self.assertEqual(permit.to_dict()['components'], ['web'])
 
