@@ -50,6 +50,30 @@ def _hex(value):
     return type(value) is str and HEX.fullmatch(value) is not None
 
 
+def _start_identity_matches(previous, current, fields):
+    """Preserve identity while allowing Docker's first-start initialization."""
+    generated = set(runtime.MANAGED_FILES.values())
+    if any(current.get(k) != previous.get(k) for k in fields
+           if k not in generated | {'HostConfig'}):
+        return False
+    before_host, after_host = dict(previous['HostConfig']), dict(current['HostConfig'])
+    if ('OomKillDisable' in before_host and 'OomKillDisable' in after_host
+            and before_host['OomKillDisable'] is None and after_host['OomKillDisable'] is False):
+        before_host['OomKillDisable'] = False
+    if before_host != after_host:
+        return False
+    for filename, key in runtime.MANAGED_FILES.items():
+        before, after = previous.get(key), current.get(key)
+        if before == after:
+            continue
+        if (previous.get('State', {}).get('Status') != 'created' or before not in ('', None)
+                or type(after) is not str or not after.startswith('/')
+                or not after.endswith('/' + current['Id'] + '/' + filename)
+                or any(ord(c) < 32 for c in after)):
+            return False
+    return True
+
+
 @dataclass(frozen=True)
 class RecoveryRequest:
     operation: str
@@ -860,8 +884,8 @@ class HostCoordinator:
                 _require(set(current) == allowed and all(current[cid] == value for cid, value in previous_inventory.items()
                          if cid != target or verb == 'create'), 'recovery-unselected-transition-drift')
                 if verb == 'start':
-                    _require(all(current[target].get(k) == previous_inventory[target].get(k)
-                                 for k in begin['fields']), 'recovery-start-identity-drift')
+                    _require(_start_identity_matches(previous_inventory[target], current[target], begin['fields']),
+                             'recovery-start-identity-drift')
                 previous_inventory = current
                 expected = _hash(current)
             guard()

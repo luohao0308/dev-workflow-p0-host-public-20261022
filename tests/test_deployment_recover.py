@@ -45,6 +45,35 @@ class Approval:
         self.calls.append('guard')
 
 
+class RecoveryStartIdentityTests(unittest.TestCase):
+    def test_first_start_initializes_only_known_docker_defaults(self):
+        docker = fixtures.MutableDocker()
+        previous = deepcopy(docker.containers[fixtures.OLD])
+        previous['State'].update(Running=False, Status='created')
+        previous['HostConfig']['OomKillDisable'] = None
+        for key in recover.runtime.MANAGED_FILES.values():
+            previous[key] = ''
+        current = deepcopy(previous)
+        current['State'].update(Running=True, Status='running')
+        current['HostConfig']['OomKillDisable'] = False
+        for filename, key in recover.runtime.MANAGED_FILES.items():
+            current[key] = '/var/lib/docker/containers/' + fixtures.OLD + '/' + filename
+        fields = ('Id', 'Name', 'Image', 'Config', 'HostConfig', *recover.runtime.MANAGED_FILES.values())
+        self.assertTrue(recover._start_identity_matches(previous, current, fields))
+        for change in ('env', 'memory', 'path', 'already-started'):
+            before, after = deepcopy(previous), deepcopy(current)
+            if change == 'env':
+                after['Config']['Env'].append('DRIFT=1')
+            elif change == 'memory':
+                after['HostConfig']['Memory'] = 128
+            elif change == 'path':
+                after['HostsPath'] = '/foreign/hosts'
+            else:
+                before['State']['Status'] = 'exited'
+            with self.subTest(change=change):
+                self.assertFalse(recover._start_identity_matches(before, after, fields))
+
+
 class RecoveryTests(unittest.TestCase):
     def setUp(self):
         self.f = fixtures.DeploymentExecuteTests(methodName='runTest')
