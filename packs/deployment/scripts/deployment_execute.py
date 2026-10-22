@@ -55,6 +55,7 @@ class ExecutionPolicy:
     writer_certificate_sha256: str
     stop_timeout: int = 10
     execution_deadline: int = 180
+    verification_policy_hash: str | None = None
 
     def __post_init__(self):
         if (type(self.runtime_policy) is not runtime.RuntimePolicy
@@ -65,11 +66,18 @@ class ExecutionPolicy:
                 or type(self.execution_deadline) is not int or not 1 <= self.execution_deadline <= 600):
             raise ExecutionError('invalid-execution-policy')
         _specifications(self.runtime_policy)
+        if (self.verification_policy_hash is not None
+                and (not isinstance(self.verification_policy_hash, str)
+                     or not runtime.HEX.fullmatch(self.verification_policy_hash))):
+            raise ExecutionError('invalid-verification-policy')
 
     def identity_hash(self):
-        return digest(dict(profile=PROFILE, runtimePolicyHash=self.runtime_policy.identity_hash(),
-                           writerCertificateSha256=self.writer_certificate_sha256,
-                           stopTimeout=self.stop_timeout, executionDeadline=self.execution_deadline))
+        value = dict(profile=PROFILE, runtimePolicyHash=self.runtime_policy.identity_hash(),
+                     writerCertificateSha256=self.writer_certificate_sha256,
+                     stopTimeout=self.stop_timeout, executionDeadline=self.execution_deadline)
+        if self.verification_policy_hash is not None:
+            value['verificationPolicyHash'] = self.verification_policy_hash
+        return digest(value)
 
 
 class DockerMutationClient:
@@ -272,17 +280,31 @@ def _request_scope(request):
 
 
 class DockerExecutor:
-    def __init__(self, policy, client, collector):
+    def __init__(self, policy, client, collector, *, verifier=None):
         if (type(policy) is not ExecutionPolicy or type(client) is not DockerMutationClient
                 or type(collector) is not runtime.TrustedDockerCollector
                 or client.policy != policy or collector.policy != policy.runtime_policy
                 or collector.client.policy != policy.runtime_policy):
             raise ExecutionError('executor-policy-mismatch')
         self.policy, self.client, self.collector = policy, client, collector
+        self.verifier = verifier
         self._policy_hash = policy.identity_hash()
         self._issued, self._lock = {}, threading.Lock()
+        self._verification_configuration()
+
+    def _verification_configuration(self):
+        if self.policy.verification_policy_hash is None:
+            if self.verifier is not None:
+                raise ExecutionError('unexpected-verification-adapter')
+            return
+        from deployment_verify import TrustedProbeVerifier
+        if (type(self.verifier) is not TrustedProbeVerifier
+                or self.verifier.policy.identity_hash() != self.policy.verification_policy_hash
+                or self.verifier.policy.runtime_policy_hash != self.policy.runtime_policy.identity_hash()):
+            raise ExecutionError('verification-adapter-required')
 
     def _fixed(self):
+        self._verification_configuration()
         if (self.policy.identity_hash() != self._policy_hash or self.client.policy != self.policy
                 or self.collector.policy != self.policy.runtime_policy
                 or self.collector.client.policy != self.policy.runtime_policy):
@@ -396,13 +418,19 @@ class DockerExecutor:
                        specHash=spec.configuration_digest(), component=component, imageId=spec.image_id,
                        beforeContainerId=old_ids[0], resourceName='dwf-' + nonce,
                        actions=['create', 'stop', 'remove', 'start'])
+        probe_binding = None
+        if self.verifier is not None:
+            probe_binding = self.verifier.bind(component, spec)
+            binding.update(verificationPolicyHash=self.policy.verification_policy_hash,
+                           probeBindingHash=digest(json.loads(probe_binding)))
         intent = ExecutionIntent(canonical(binding), self)
         # Repository ID is supplied by the host, not a Docker scope identity.
         scope = json.loads(_request_scope(request))
         scope.pop('repository_id')
         record = dict(intent=intent, binding=intent.binding_json, root=root, plan=frozen, operation=operation,
                       observation=observation, rollback_target=rollback_target, scope=canonical(scope),
-                      spec=spec, entry=entry, baseline=canonical(baseline), used=False)
+                      spec=spec, entry=entry, baseline=canonical(baseline), used=False,
+                      probe_binding=probe_binding)
         record['image'] = self._image(record, deadline)
         with self._lock:
             self._issued[id(intent)] = record
@@ -571,11 +599,29 @@ class DockerExecutor:
                 if actual != sdk.ordered(json.loads(request.after_json)['components']):
                     raise ExecutionError('final-runtime-mapping-mismatch')
                 permit.guard_for_execution(runtime_check=lambda: self._stage(record, 4, new_id, deadline))
+                verification = None
+                if self.verifier is not None:
+                    verification = self.verifier.check(record['probe_binding'],
+                        container=self._inventory(deadline)[new_id],
+                        guard=lambda: permit.guard_for_execution(
+                            runtime_check=lambda: self._stage(record, 4, new_id, deadline)),
+                        deadline=deadline)
+                    observation = self.collector.collect()
+                    self.collector.validate(observation)
+                    if sdk.ordered(observation.snapshot()['components']) != actual:
+                        raise ExecutionError('runtime-changed-during-verification')
+                    permit.guard_for_execution(runtime_check=lambda: self._stage(record, 4, new_id, deadline))
                 result.update(status='executed-verified', execution='performed',
                               declaredVersion=json.loads(request.after_json)['version'],
                               runtimeVersion=observation.snapshot()['version'], runtimeObservation=observation.to_dict())
                 result['verification']['runtime'] = 'verified'
                 result['verification']['deployment' if request.operation == 'deployment-deploy' else 'rollback'] = 'verified'
+                if verification is not None:
+                    result['verification'].update(health=verification['health'], smoke=verification['smoke'])
+                    result['probeChecks'] = verification['checks']
+                    result['verificationPolicyHash'] = self.policy.verification_policy_hash
+                    if verification['passed'] is not True:
+                        result.update(status='executed-unhealthy', failureCode='post-deployment-verification-failed')
                 sdk._audit(root, relative, result)
                 # Keep actual collector-issued proof for a fresh, separate rollback
                 # preparation. Audit/export above contains only its JSON evidence.
