@@ -120,6 +120,22 @@ class DeploymentVerificationTests(unittest.TestCase):
         self.assertNotEqual(result['verification']['health'], 'failed')
         self.assertEqual(len(self.base.docker.writes), 4)
 
+    def test_shadowed_verifier_method_cannot_bypass_required_checks(self):
+        self.fail = 'business'
+        self.verifier.check = lambda *a, **k: dict(passed=True, health='passed', smoke='passed', checks=[])
+        result = self.base.execute()
+        self.assertEqual(result['status'], 'executed-unhealthy')
+        self.assertTrue(result['probeChecks'])
+
+    def test_changed_probe_cache_refused_before_authorization(self):
+        key = ('web', 'sha256:' + 'b' * 64)
+        profile = json.loads(self.verifier._profiles[key])
+        profile['health'], profile['smoke'] = [], []
+        self.verifier._profiles[key] = json.dumps(profile)
+        with self.assertRaises(verify.VerificationError):
+            self.base.authorize()
+        self.assertFalse(self.base.docker.writes)
+
     def test_required_verifier_cannot_be_omitted(self):
         with self.assertRaises(execution.backend.ExecutionError):
             execution.backend.DockerExecutor(self.base.policy, self.base.client, self.base.collector)

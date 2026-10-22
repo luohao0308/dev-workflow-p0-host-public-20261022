@@ -255,7 +255,7 @@ def _headers(headers, max_body):
     length, transfer = values.get('content-length', []), values.get('transfer-encoding', [])
     if (len(length) > 1 or (length and transfer)
             or (length and (not re.fullmatch(r'[0-9]{1,10}', length[0]) or int(length[0]) > max_body))
-            or (transfer and transfer != ['chunked'])
+            or bool(transfer)
             or values.get('content-encoding', ['identity']) != ['identity']):
         raise VerificationError('probe-response-rejected')
     return int(length[0]) if length else None
@@ -288,6 +288,7 @@ class TrustedProbeVerifier:
         self.policy, self.runtime_policy = policy, runtime_policy
         self._policy_hash = policy.identity_hash()
         self._transport = transport
+        self._trusted_transport = transport
         self._profiles, self._specs, self._bindings, self._contexts = {}, {}, {}, {}
         try:
             specs = specification.parse_specifications(runtime_policy.specifications_json)
@@ -316,7 +317,24 @@ class TrustedProbeVerifier:
         except (ValueError, TypeError, OSError):
             raise VerificationError('probe-scope-rejected') from None
 
+    def _fixed(self):
+        if (type(self) is not TrustedProbeVerifier or type(self.policy) is not ProbePolicy
+                or self.policy.identity_hash() != self._policy_hash
+                or self.runtime_policy.identity_hash() != self.policy.runtime_policy_hash
+                or self._transport is not self._trusted_transport):
+            raise VerificationError('probe-scope-rejected')
+        expected = {(p['component'], p['imageId']): _canonical(p)
+                    for p in _json(self.policy.profiles_json)['profiles']}
+        if self._profiles != expected:
+            raise VerificationError('probe-scope-rejected')
+        recipes = specification.parse_specifications(self.runtime_policy.specifications_json)
+        if (set(self._specs) != set(expected)
+                or any(type(spec) is not specification.ContainerSpec
+                       or spec != recipes.get(key) for key, spec in self._specs.items())):
+            raise VerificationError('probe-scope-rejected')
+
     def bind(self, component: str, spec: specification.ContainerSpec) -> str:
+        TrustedProbeVerifier._fixed(self)
         if (type(spec) is not specification.ContainerSpec or component != spec.component
                 or (component, spec.image_id) not in self._profiles):
             raise VerificationError('probe-binding-rejected')
@@ -386,6 +404,7 @@ class TrustedProbeVerifier:
             raise VerificationError('probe-deadline-exceeded')
 
     def check(self, binding_json: str, *, container: dict, guard, deadline: float) -> dict:
+        TrustedProbeVerifier._fixed(self)
         if (type(binding_json) is not str or binding_json not in self._bindings
                 or not callable(guard) or type(deadline) not in (int, float) or not math.isfinite(deadline)
                 or type(self.policy) is not ProbePolicy or self.policy.identity_hash() != self._policy_hash
@@ -420,7 +439,7 @@ class TrustedProbeVerifier:
                 check = {'id': configured_probe['id'], 'phase': phase, 'status': 'failed', 'attempts': 0,
                          'durationMs': 0, 'responseHash': None, 'errorCode': None, 'httpStatus': None}
                 for attempt in range(configured_probe['attempts']):
-                    self._guard(guard, deadline)
+                    TrustedProbeVerifier._guard(guard, deadline)
                     # Fresh private trees keep even trusted hooks from mutating cached policy.
                     current = _json(self._profiles[key])
                     probe = current[phase][probe_index]
@@ -428,12 +447,12 @@ class TrustedProbeVerifier:
                     check.update(attempts=attempt + 1, responseHash=None, httpStatus=None)
                     code, response = None, None
                     try:
-                        response = self._request(current, probe, attempt_deadline)
+                        response = TrustedProbeVerifier._request(self, current, probe, attempt_deadline)
                     except VerificationError as error:
                         code = str(error)
                     except (OSError, http.client.HTTPException):
                         code = 'probe-network-failed'
-                    self._guard(guard, deadline)
+                    TrustedProbeVerifier._guard(guard, deadline)
                     if time.monotonic() >= attempt_deadline:
                         code = 'probe-deadline-exceeded'
                     if code is None:

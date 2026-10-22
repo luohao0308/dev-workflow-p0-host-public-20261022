@@ -302,6 +302,7 @@ class DockerExecutor:
                 or self.verifier.policy.identity_hash() != self.policy.verification_policy_hash
                 or self.verifier.policy.runtime_policy_hash != self.policy.runtime_policy.identity_hash()):
             raise ExecutionError('verification-adapter-required')
+        TrustedProbeVerifier._fixed(self.verifier)
 
     def _fixed(self):
         self._verification_configuration()
@@ -420,7 +421,8 @@ class DockerExecutor:
                        actions=['create', 'stop', 'remove', 'start'])
         probe_binding = None
         if self.verifier is not None:
-            probe_binding = self.verifier.bind(component, spec)
+            from deployment_verify import TrustedProbeVerifier
+            probe_binding = TrustedProbeVerifier.bind(self.verifier, component, spec)
             binding.update(verificationPolicyHash=self.policy.verification_policy_hash,
                            probeBindingHash=digest(json.loads(probe_binding)))
         intent = ExecutionIntent(canonical(binding), self)
@@ -601,7 +603,8 @@ class DockerExecutor:
                 permit.guard_for_execution(runtime_check=lambda: self._stage(record, 4, new_id, deadline))
                 verification = None
                 if self.verifier is not None:
-                    verification = self.verifier.check(record['probe_binding'],
+                    from deployment_verify import TrustedProbeVerifier
+                    verification = TrustedProbeVerifier.check(self.verifier, record['probe_binding'],
                         container=self._inventory(deadline)[new_id],
                         guard=lambda: permit.guard_for_execution(
                             runtime_check=lambda: self._stage(record, 4, new_id, deadline)),

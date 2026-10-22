@@ -261,7 +261,7 @@ class VerifierTests(unittest.TestCase):
         with self.assertRaisesRegex(verify.VerificationError, '^probe-binding-rejected$'):
             other.check(binding, container=self.container, guard=lambda: None, deadline=time.monotonic() + 1)
         verifier.runtime_policy = replace(self.runtime, production=True)
-        with self.assertRaisesRegex(verify.VerificationError, '^probe-binding-rejected$'):
+        with self.assertRaisesRegex(verify.VerificationError, '^probe-scope-rejected$'):
             self.run_check(verifier)
         self.assertEqual(self.calls, [])
 
@@ -337,6 +337,20 @@ class VerifierTests(unittest.TestCase):
             return 200, [], b'{"ok":true}'
         # Mutating a hook argument must not even change the active predicates.
         self.assertTrue(self.run_check(self.verifier(transport=mutate))['passed'])
+
+    def test_chunked_wire_responses_are_refused_before_body_parsing(self):
+        for wire in (b'b\r\n{"ok":true}XX0\r\n\r\n',
+                     b'b\r\n{"ok":true}\r\n0\r\n',
+                     b'b\r\n{"ok":true}\r\n0\r\n\r\n'):
+            peer = mock.Mock()
+            peer.makefile.side_effect = lambda *args: BytesIO(
+                b'HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n' + wire)
+            with self.subTest(wire=wire), mock.patch.object(verify.socket, 'socket', return_value=peer), \
+                    mock.patch.object(runtime, 'deadline_watchdog'):
+                verifier = verify.TrustedProbeVerifier(probe_policy(self.runtime, [self.profile]), self.runtime)
+                result = self.run_check(verifier)
+                self.assertFalse(result['passed'])
+                self.assertEqual(result['checks'][0]['errorCode'], 'probe-response-rejected')
 
     def test_in_memory_socket_http_parser_and_watchdog_without_dns(self):
         peer = mock.Mock()
