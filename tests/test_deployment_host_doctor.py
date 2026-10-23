@@ -121,6 +121,7 @@ class DiagnosticContractTests(unittest.TestCase):
             def git(*args):
                 return subprocess.run(['git','-C',str(root),*args],check=True,capture_output=True).stdout.decode().strip()
             git('init'); git('config','user.name','Fixture'); git('config','user.email','fixture@example.invalid')
+            git('config','core.autocrlf','false')
             (root/'scripts').mkdir()
             source = root/'scripts'/'fixture.py'
             source.write_text('print("trusted")\n')

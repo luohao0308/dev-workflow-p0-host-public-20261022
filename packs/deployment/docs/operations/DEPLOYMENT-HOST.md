@@ -2,7 +2,7 @@
 
 These distribution-only tools help configure and inspect a trusted deployment host. They do not install host credentials into a candidate checkout, initialize execution authority, deploy containers, or grant approval. Run them from a separately trusted, pinned dev-workflow distribution. Do not run a candidate's copy of the scripts as a trusted host.
 
-Start with [`examples/deployment-host/host.example.json`](../../../../examples/deployment-host/host.example.json) and its [README](../../../../examples/deployment-host/README.md). The values are synthetic fixtures, including the catalog, specifications, certificates, identities and commit hashes. Replace them for the intended host; the example is not a ready deployment configuration.
+Start with [`examples/deployment-host/host.example.json`](../../../../examples/deployment-host/host.example.json) and its [usage guide](../../../../examples/deployment-host/USAGE.md). The values are synthetic fixtures, including the catalog, specifications, certificates, identities and commit hashes. Replace them for the intended host; the example is not a ready deployment configuration.
 
 ## Configuration contract
 
