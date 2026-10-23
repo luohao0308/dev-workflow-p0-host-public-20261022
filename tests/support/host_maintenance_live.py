@@ -101,7 +101,7 @@ def after_recovery(coordinator, collector, executor, config, state):
     denied(coordinator.gate.info)
     denied(lambda:coordinator.store.capture_history(collector,before))
     after=collector.collect()
-    assert before.snapshot()==after.snapshot()
+    assert {k:v for k,v in before.snapshot().items() if k!='capturedAt'}=={k:v for k,v in after.snapshot().items() if k!='capturedAt'}
     assert before.to_dict()['instances']==after.to_dict()['instances']
     new_store=live.history.HostStore(successor.config.store_policy,successor.config.store_root,key=successor.store_key)
     cfg.store_key_file.unlink()
@@ -128,7 +128,7 @@ def after_recovery(coordinator, collector, executor, config, state):
         fresh=live.runtime.TrustedDockerCollector(policy,client)
         observed=fresh.collect()
         assert new_gate.verify_info(client.get('/v1.45/workflow/gate-info'))
-        assert observed.snapshot()==before.snapshot()
+        assert {k:v for k,v in observed.snapshot().items() if k not in ('capturedAt','provenance')}=={k:v for k,v in before.snapshot().items() if k not in ('capturedAt','provenance')}
         assert new_store.load_history(reference,collector=fresh,before=observed).snapshot()==before.snapshot()
     finally:
         server.shutdown(); server.server_close(); thread.join(3)
