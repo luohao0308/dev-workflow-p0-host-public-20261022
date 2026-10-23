@@ -106,14 +106,14 @@ def after_recovery(coordinator, collector, executor, config, state):
     new_store=live.history.HostStore(successor.config.store_policy,successor.config.store_root,key=successor.store_key)
     cfg.store_key_file.unlink()
     imported=new_store.load_history(reference,collector=collector,before=after)
-    assert imported.snapshot()==before.snapshot()
+    assert imported.snapshot()==captured.snapshot()
     unavailable=maintenance.MaintenanceHost(replace(cfg,store_root=cfg.store_root.with_name('absent-source-store')),source.store_key,source.gate_key)
     restored=destination(source,'maintenance-restored')
     maintenance.verify(unavailable,raw)
     maintenance.restore(unavailable,restored,raw)
     assert not restored.config.gate_root.exists()
     restored_store=live.history.HostStore(restored.config.store_policy,restored.config.store_root,key=restored.store_key)
-    assert restored_store.load_history(reference,collector=collector,before=after).snapshot()==before.snapshot()
+    assert restored_store.load_history(reference,collector=collector,before=after).snapshot()==captured.snapshot()
     new_gate=live.gateway.FileWriterGate(successor.config.gate_policy,successor.config.gate_root,key=successor.gate_key)
     directory=state['directory']
     context=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -129,7 +129,7 @@ def after_recovery(coordinator, collector, executor, config, state):
         observed=fresh.collect()
         assert new_gate.verify_info(client.get('/v1.45/workflow/gate-info'))
         assert {k:v for k,v in observed.snapshot().items() if k not in ('capturedAt','provenance')}=={k:v for k,v in before.snapshot().items() if k not in ('capturedAt','provenance')}
-        assert new_store.load_history(reference,collector=fresh,before=observed).snapshot()==before.snapshot()
+        assert new_store.load_history(reference,collector=fresh,before=observed).snapshot()==captured.snapshot()
     finally:
         server.shutdown(); server.server_close(); thread.join(3)
     live.provision.save(output/'summary.json',dict(result='passed',realDocker=True,realMTLS=True,
