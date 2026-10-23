@@ -11,6 +11,7 @@ import ssl
 import subprocess
 import sys
 import threading
+import traceback
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT/'scripts'))
@@ -163,4 +164,6 @@ if __name__=='__main__':
     try:
         main()
     except Exception as error:
+        output=ROOT/'host-maintenance-results'; output.mkdir(exist_ok=True)
+        live.provision.save(output/'failure.json', dict(result='failed', errorType=type(error).__name__, locations=[Path(item.filename).name+':'+str(item.lineno) for item in traceback.extract_tb(error.__traceback__)]))
         raise SystemExit('Host maintenance fixture failed: '+type(error).__name__)
