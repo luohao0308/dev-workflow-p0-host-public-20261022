@@ -18,7 +18,7 @@ jobs:
         shell: pwsh
         env:
           PYTHONDONTWRITEBYTECODE: '1'
-        run: python -m unittest tests.test_upgrade_resolved -v
+        run: python -m unittest tests.test_reviewed_windows_probe -v
       - name: Native PowerShell install and audit regressions
         shell: pwsh
         run: ./tests/integration.ps1
