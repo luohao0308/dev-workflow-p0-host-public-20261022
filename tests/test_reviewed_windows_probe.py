@@ -16,9 +16,11 @@ class ReviewedWindowsProbe(unittest.TestCase):
         support.WindowsUpgradeTests.setUpClass.__func__(cls)
 
     setUp = support.WindowsUpgradeTests.setUp
+    run_command = staticmethod(support.WindowsUpgradeTests.run_command)
     cli = support.WindowsUpgradeTests.cli
     plan = support.WindowsUpgradeTests.plan
     powershell = support.WindowsUpgradeTests.powershell
+    assert_success = support.WindowsUpgradeTests.assert_success
 
     def test_reviewed_core_adoption_guard_retention_and_rollback(self):
         agents = self.target / 'AGENTS.md'
